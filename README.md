@@ -21,6 +21,10 @@ See [Summary of our work](Summary.md) for details and our [Paper](https://arxiv.
 
 
 
+## SecondLook-CRC: offline second-look review
+
+[SecondLook-CRC](SecondLook-CRC/) is an offline AI tool for reviewing recorded colonoscopy and capsule endoscopy studies after the procedure. It flags potentially missed lesions with a visual explanation for each one and shows blind segments, the parts of the recording too poor to review. VR-Caps can supply synthetic training data for it. See its [README](SecondLook-CRC/README.md) and [design document](SecondLook-CRC/docs/DESIGN.md).
+
 ## Getting Started
 
 ### 1. Installation
