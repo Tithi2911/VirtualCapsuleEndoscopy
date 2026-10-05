@@ -51,12 +51,15 @@ def _image_files(folder: Path) -> list[Path]:
     return [p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS]
 
 
-def _resize(image: np.ndarray, working_size: int) -> np.ndarray:
+def resize_to_working_size(image: np.ndarray, working_size: int) -> np.ndarray:
+    """Shrink `image` so its longest side is `working_size` (never enlarged). Every analysed
+    frame goes through this, and the lesion classifier's training images do too."""
     h, w = image.shape[:2]
     scale = working_size / max(h, w)
     if scale >= 1.0:
         return image
     return cv2.resize(image, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+
 
 
 def load_frames(
@@ -96,7 +99,7 @@ def _from_images(files, analysis_fps, working_size, sequence_fps) -> Iterator[Fr
         image = cv2.imread(str(files[i]), cv2.IMREAD_COLOR)
         if image is None:
             continue
-        yield Frame(i, i / sequence_fps, _resize(image, working_size), files[i].name)
+        yield Frame(i, i / sequence_fps, resize_to_working_size(image, working_size), files[i].name)
 
 
 def _from_video(path: Path, analysis_fps: float, working_size: int) -> Iterator[Frame]:
@@ -114,7 +117,7 @@ def _from_video(path: Path, analysis_fps: float, working_size: int) -> Iterator[
             if index % step == 0:
                 ok, image = cap.retrieve()
                 if ok:
-                    yield Frame(index, index / fps, _resize(image, working_size), path.name)
+                    yield Frame(index, index / fps, resize_to_working_size(image, working_size), path.name)
             index += 1
     finally:
         cap.release()

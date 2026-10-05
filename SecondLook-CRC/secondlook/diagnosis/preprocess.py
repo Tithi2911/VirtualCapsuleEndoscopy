@@ -1,15 +1,47 @@
 """Lesion crop used by BOTH classifier training and inference.
 
 Keeping a single implementation prevents train/serve skew, where the model is
-trained on differently framed images from the ones it sees in use.
+trained on differently framed or differently resolved images from the ones it
+sees in use. Framing is fixed by crop_lesion. Resolution is fixed by
+at_working_size: the analysis pipeline shrinks every frame to its working size
+(512 px for colonoscopy) before anything else, so a 120 px lesion in an HD
+frame reaches the classifier as about 32 px. Training images are shrunk the
+same way first, otherwise the model would learn surface detail it never gets
+in use and its validation figures would overstate deployed performance.
 """
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cv2
 import numpy as np
 
+from ..ingest import resize_to_working_size
+
 DEFAULT_MARGIN = 0.25  # context around the lesion, as a fraction of its larger side
+BBox = tuple[int, int, int, int]
+
+
+def at_working_size(
+    image: np.ndarray, bbox: Optional[BBox], working_size: Optional[int]
+) -> tuple[np.ndarray, Optional[BBox]]:
+    """`image` shrunk as ingest shrinks every analysed frame (longest side at most
+    `working_size`; never enlarged), with `bbox` (x, y, w, h) moved to the new pixel grid.
+    A `working_size` of None leaves both unchanged."""
+    if working_size is None:
+        return image, bbox
+    small = resize_to_working_size(image, working_size)
+    if small is image or bbox is None:
+        return small, bbox
+    h, w = small.shape[:2]
+    sy, sx = h / image.shape[0], w / image.shape[1]
+    x, y, bw, bh = bbox
+    x0 = min(max(int(round(x * sx)), 0), w - 1)
+    y0 = min(max(int(round(y * sy)), 0), h - 1)
+    x1 = min(max(int(round((x + bw) * sx)), x0 + 1), w)
+    y1 = min(max(int(round((y + bh) * sy)), y0 + 1), h)
+    return small, (x0, y0, x1 - x0, y1 - y0)
 
 
 def square_crop_box(

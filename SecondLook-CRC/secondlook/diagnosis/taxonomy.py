@@ -5,11 +5,20 @@ endoscopic images is *optical diagnosis*: predict which histology a lesion will
 turn out to have, grouped here into three clinically actionable categories:
 
 * BENIGN        - non-neoplastic: hyperplastic polyp, inflammatory / pseudo-polyp,
-                  normal mucosa, lymphoid aggregate, lipoma.
+                  normal mucosa, lymphoid aggregate.
 * PRECANCEROUS  - neoplastic but not invasive: conventional adenomas (tubular,
                   tubulovillous, villous; low- or high-grade dysplasia), sessile
                   serrated lesions, traditional serrated adenomas.
 * CANCEROUS     - adenocarcinoma, including suspected submucosal invasion.
+
+"Benign" means non-neoplastic histology, not "of no consequence": UK surveillance
+guidance (BSG/ACPGBI/PHE 2020) counts hyperplastic polyps, apart from diminutive
+rectal ones, among the premalignant serrated polyps.
+
+Labels that do not fit these epithelial categories, or that are too vague to
+place, are deliberately absent so category_for() raises and a person decides:
+"neoplastic" alone could be an adenoma or a carcinoma, and a lipoma is a benign
+mesenchymal neoplasm, neither non-neoplastic nor precancerous.
 
 Cell-level diagnosis (dysplasia grade, invasion depth) is made by a
 pathologist on the resected tissue. Training labels should come from that
@@ -38,7 +47,7 @@ CATEGORIES: list[str] = [c.value for c in DiagnosticCategory]
 
 DISPLAY_NAME = {
     DiagnosticCategory.BENIGN.value: "Benign (non-neoplastic)",
-    DiagnosticCategory.PRECANCEROUS.value: "Precancerous (adenoma / serrated lesion)",
+    DiagnosticCategory.PRECANCEROUS.value: "Precancerous (adenoma / SSL / TSA)",
     DiagnosticCategory.CANCEROUS.value: "Suspected cancer",
 }
 
@@ -60,7 +69,6 @@ HISTOLOGY_TO_CATEGORY: dict[str, DiagnosticCategory] = {
     "inflammatory polyp": _B,
     "pseudopolyp": _B,
     "lymphoid aggregate": _B,
-    "lipoma": _B,
     "non neoplastic": _B,
     "nonneoplastic": _B,
     # Neoplastic, non-invasive
@@ -69,6 +77,7 @@ HISTOLOGY_TO_CATEGORY: dict[str, DiagnosticCategory] = {
     "tubular adenoma": _P,
     "ta": _P,
     "tubulovillous adenoma": _P,
+    "tubulo villous adenoma": _P,
     "tva": _P,
     "villous adenoma": _P,
     "va": _P,
@@ -84,7 +93,6 @@ HISTOLOGY_TO_CATEGORY: dict[str, DiagnosticCategory] = {
     "ssa p": _P,
     "traditional serrated adenoma": _P,
     "tsa": _P,
-    "neoplastic": _P,
     # Invasive
     "adenocarcinoma": _C,
     "carcinoma": _C,

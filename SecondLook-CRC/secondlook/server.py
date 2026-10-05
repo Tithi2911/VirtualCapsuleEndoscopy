@@ -16,7 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import INTENDED_USE_NOTICE
+from .characterise import Characteriser, NullCharacteriser
 from .cli import run_analysis
+from .diagnosis import load_classifier
+from .diagnosis.classifier import SAFETY_STATEMENT
 from .ingest import IMAGE_EXTS, VIDEO_EXTS
 from .models import Modality
 
@@ -32,9 +35,11 @@ main{max-width:640px;margin:0 auto;padding:32px 16px}.card{background:var(--card
 label{display:block;margin:12px 0 4px;font-weight:600}input,select{width:100%;padding:8px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px}
 button{margin-top:16px;background:var(--accent);color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:1rem;cursor:pointer}
 .notice{border-left:4px solid var(--warn);padding:8px 12px;margin-bottom:16px;background:var(--card)}#status{margin-top:12px}
+.muted{opacity:.8;font-size:.9rem}
 </style></head><body><main>
 <h1>SecondLook &mdash; upload a recording</h1>
 <div class="notice">__NOTICE__ Runs entirely on this computer.</div>
+<p class="muted">__CLASSIFIER__</p>
 <div class="card">
 <label for="file">Video file or single image</label><input id="file" type="file" accept="video/*,image/*">
 <label for="modality">Modality</label><select id="modality"><option value="colonoscopy">Traditional colonoscopy</option><option value="capsule">Capsule endoscopy</option></select>
@@ -56,10 +61,34 @@ async function go(){
 </script></body></html>"""
 
 
-def make_handler(data_dir: Path):
+def classifier_status(characteriser: Characteriser) -> str:
+    if isinstance(characteriser, NullCharacteriser):
+        return "No lesion classifier loaded: findings are detected but not characterised (start with --classifier MODEL.onnx)."
+    info = getattr(characteriser, "info", None) or {}
+    trained_for = f", trained for {' and '.join(info['modalities'])}" if info.get("modalities") else ""
+    parts = [
+        f"Lesion classifier: {characteriser.name} {characteriser.version} (benign / precancerous / cancerous"
+        f"{trained_for}).",
+        info.get("validation_status"),
+        SAFETY_STATEMENT,
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def make_handler(data_dir: Path, classifier_path: Path | str | None = None):
     data_dir.mkdir(parents=True, exist_ok=True)
+    # Loaded once, so a bad model fails at start-up and requests share one ONNX session.
+    characteriser = load_classifier(classifier_path) if classifier_path else NullCharacteriser()
+    status = classifier_status(characteriser)
+    upload_page = (
+        UPLOAD_PAGE.replace("__NOTICE__", html.escape(INTENDED_USE_NOTICE))
+        .replace("__CLASSIFIER__", html.escape(status))
+        .encode()
+    )
 
     class Handler(BaseHTTPRequestHandler):
+        status_text = status
+
         def _send(self, status, body: bytes, ctype: str):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -73,8 +102,7 @@ def make_handler(data_dir: Path):
 
         def do_GET(self):
             if self.path in ("/", "/index.html"):
-                page = UPLOAD_PAGE.replace("__NOTICE__", html.escape(INTENDED_USE_NOTICE))
-                return self._send(HTTPStatus.OK, page.encode(), "text/html; charset=utf-8")
+                return self._send(HTTPStatus.OK, upload_page, "text/html; charset=utf-8")
             if self.path == "/runs":
                 runs = sorted((p for p in data_dir.iterdir() if (p / "report.html").exists()), reverse=True)
                 items = "".join(f'<li><a href="/runs/{p.name}/report.html">{html.escape(p.name)}</a></li>' for p in runs)
@@ -117,7 +145,8 @@ def make_handler(data_dir: Path):
                 report_path = run_dir / "procedure_report.json"
                 report_path.write_text(unquote(self.headers["X-Report"]))
             try:
-                run_analysis(upload, run_dir, modality, report_path, audit_log=data_dir / "audit.jsonl")
+                run_analysis(upload, run_dir, modality, report_path, audit_log=data_dir / "audit.jsonl",
+                             characteriser=characteriser)
             except Exception as e:  # report the failure to the browser rather than dropping the connection
                 return self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(e)})
             self._json(HTTPStatus.OK, {"report": f"/runs/{run_id}/report.html"})
@@ -125,9 +154,11 @@ def make_handler(data_dir: Path):
     return Handler
 
 
-def serve(port: int, data_dir: Path) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(Path(data_dir)))
+def serve(port: int, data_dir: Path, classifier_path: Path | str | None = None) -> None:
+    handler = make_handler(Path(data_dir), classifier_path)
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     print(f"SecondLook running at http://127.0.0.1:{port}  (Ctrl+C to stop)")
+    print(handler.status_text)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

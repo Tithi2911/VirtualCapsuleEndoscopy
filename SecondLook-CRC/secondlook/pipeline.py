@@ -10,7 +10,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from . import explain, quality
-from .characterise import Characteriser, NullCharacteriser
+from .characterise import Characteriser, NullCharacteriser, not_applied, unsupported_reason
 from .config import AnalysisConfig
 from .detectors import Detector
 from .ingest import load_frames
@@ -40,6 +40,9 @@ class AnalysisResult:
     runtime_s: float
     # finding_id -> {"original", "overlay", "filmstrip", optional "diagnosis"} BGR images
     images: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    # Characteriser provenance (file hashes, calibration, validation status, intended use) and,
+    # under "unsupported_reason", why it was not applied to this recording.
+    characteriser_info: dict = field(default_factory=dict)
 
 
 def analyse(
@@ -78,13 +81,17 @@ def analyse(
     findings = tracker.findings()
     unmatched = compare(findings, reported, cfg)
 
+    not_supported = unsupported_reason(characteriser, cfg)
     images = {}
     for f in findings:
         best = f.best
         img = kept_images[best.frame_index]
         f.rationale = explain.rationale(f, quality_by_index.get(best.frame_index))
         finding_frames = {d.frame_index: kept_images[d.frame_index] for d in f.detections}
-        f.characterisation = characteriser.characterise(f, finding_frames)
+        if not_supported:
+            f.characterisation = not_applied(characteriser, not_supported)
+        else:
+            f.characterisation = characteriser.characterise(f, finding_frames)
         picks = np.linspace(0, len(f.detections) - 1, min(FILMSTRIP_FRAMES, len(f.detections))).round().astype(int)
         strip = [kept_images[f.detections[i].frame_index] for i in picks]
         images[f.finding_id] = {
@@ -113,4 +120,6 @@ def analyse(
         timeline=[(f.timestamp_s, q.informative) for f, q in zip(frames, qualities)],
         runtime_s=time.perf_counter() - started,
         images=images,
+        characteriser_info={**(getattr(characteriser, "info", None) or {}),
+                            **({"unsupported_reason": not_supported} if not_supported else {})},
     )

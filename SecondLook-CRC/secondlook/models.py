@@ -68,15 +68,19 @@ class Characterisation:
     model: Optional[str] = None
     model_version: Optional[str] = None
     category: Optional[str] = None
-    # Calibrated probabilities per category, aggregated over the frames used.
+    # Probabilities per category, averaged over the frames used.
     probabilities: dict[str, float] = field(default_factory=dict)
+    # True only when the model's temperature was fitted on validation data; otherwise the
+    # probabilities are raw model outputs and must not be read as calibrated risks.
+    calibrated: Optional[bool] = None
     confidence: Optional[float] = None  # probability of the predicted category
     abstained: bool = False
     abstain_reason: Optional[str] = None
     frames_used: int = 0
     # Fraction of the frames used whose own top category equals the aggregate category.
     frame_agreement: Optional[float] = None
-    malignancy_risk: Optional[float] = None  # P(cancerous)
+    malignancy_risk: Optional[float] = None  # P(cancerous), averaged over frames
+    peak_malignancy_risk: Optional[float] = None  # highest single-frame P(cancerous)
     neoplasia_risk: Optional[float] = None  # P(precancerous) + P(cancerous)
     histology_prediction: Optional[str] = None  # finer subtype, only if the model predicts one
     morphology: Optional[str] = None  # e.g. Paris classification, if a model provides it

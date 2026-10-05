@@ -17,8 +17,12 @@ colonoscopy video or capsule study. The software then:
 1. finds candidate lesions (polyps, possible neoplasia) the AI can see,
 2. compares them with what the endoscopist reported and flags the **potentially missed** ones,
 3. shows **where the recording was too poor to review** (blind segments),
-4. explains each flag with a heatmap, the lesion outline, a filmstrip and plain-English reasons, and
-5. records a second reader's decision for each flag. These decisions feed the report, the audit trail and model retraining.
+4. explains each flag with a heatmap, the lesion outline, a filmstrip and plain-English reasons,
+5. when a trained lesion classifier is supplied, predicts each finding's likely histology category
+   (benign, precancerous or cancerous), or says it is unsure. This is optical diagnosis, a
+   prediction of histology, not a histological diagnosis ([DIAGNOSIS.md](DIAGNOSIS.md)), and
+6. records a second reader's decision for each flag, including their own optical diagnosis and the
+   histology result. These decisions feed the report, the audit trail and model retraining.
 
 It is designed as the shared "brain" between the company's products:
 
@@ -53,6 +57,7 @@ to collect. Together these close the loop.
 | Colonoscopy only, academic + clinical | Scope fixed to the lower GI tract; intended-use statement printed on every output | ✅ |
 | Both traditional colonoscopy and capsule explicitly | Separate modality profiles (sampling, quality thresholds, tracking, report tolerance) | ✅ `config.py` |
 | Visual explanation for every flag, not just a box | Evidence heatmap, exact outline, filmstrip and written rationale for every finding | ✅ `explain.py` |
+| Detect **and diagnose** benign, precancerous and cancerous lesions | Optical diagnosis (CADx) per finding by a calibrated ONNX classifier: multi-frame aggregation, abstention, occlusion explanation, safety statement on every prediction. Histopathology remains the reference standard. See [DIAGNOSIS.md](DIAGNOSIS.md) | Research feature: `diagnosis/`, `training/train_classifier.py`. No validated model yet; needs histology-labelled data |
 | Fully local, on-premises at first (NHS Scotland) | No network calls; web UI binds to 127.0.0.1; audit log stored locally; inputs identified by hash | ✅ |
 | Clinical **and** research/audit use | JSON output for research; HTML report for clinicians; tamper-evident audit log | ✅ |
 | Second-look tool in the reporting pathway | Second-reader decision capture and sign-off export, linked to the procedure report | ✅ basic · ⏳ integration with endoscopy reporting systems |
@@ -80,7 +85,10 @@ to collect. Together these close the loop.
  review.py ── compare with procedure report ──▶ reported / potentially missed / not compared
    │
    ▼
- characterise.py ── CADx plug-in (histology, malignancy risk) — empty until validated
+ characterise.py + diagnosis/ ── optical diagnosis per finding (only with --classifier):
+   │      up to 8 frames → shared lesion crop → ONNX classifier → temperature-calibrated
+   │      probabilities → averaged → benign / precancerous / cancerous, or abstain;
+   │      occlusion map as the explanation
    │
    ▼
  explain.py + report.py ── heatmap overlay, outline, filmstrip, rationale
@@ -107,9 +115,21 @@ Interfaces: `cli.py` (scripting, batch audits, research) and `server.py` (local 
   when a procedure report was supplied and no reported lesion falls within the time tolerance
   of that finding. Matching is one to one. Reported lesions the AI did not find are listed too:
   they are AI false negatives and useful for validation.
-* **Characterisation is deliberately off.** Malignancy-risk outputs carry the most clinical risk
-  and need histology-labelled training data. The fields already exist in the outputs, but the
-  report states "uncharacterised" until a validated model is plugged in.
+* **Characterisation is opt-in, calibrated and allowed to abstain.** Optical diagnosis carries
+  the most clinical risk of any output and needs histology-labelled training data. It runs only
+  when a trained classifier is supplied; otherwise each finding is "Not characterised" and no
+  untrained rule ever guesses a category. A model is an ONNX file plus a sidecar that fixes class
+  order, preprocessing, modality, working size, calibration temperature and abstention
+  thresholds, and is checked against the ONNX file when loaded. Training and inference share
+  one lesion-crop function and shrink images to the same working size first, so the model
+  sees the same framing and resolution in use as in training. Probabilities are averaged over
+  several frames, and the classifier answers "indeterminate" when confidence or frame
+  agreement is low, when a benign call would not be more likely than neoplasia, or when some
+  frames confidently point to a higher-risk category. Errors that under-call (a cancer called
+  benign) are treated as the worst, in the label mapping, the decision rule and the headline
+  metrics, which score the decision the report actually shows.
+  Every prediction carries the statement that it is a prediction of histology, to be confirmed
+  by histopathology. Details: [DIAGNOSIS.md](DIAGNOSIS.md).
 * **ONNX as the model boundary.** It keeps runtime dependencies small, runs on CPU in hospital
   IT, and is portable to embedded targets (MADAlpha) and to the simulator (MADSyncro).
 
@@ -140,11 +160,14 @@ missed-finding comparison, local UI, audit, synthetic tests.
 * Login, roles (trainee / consultant / researcher), multi-user audit, job queue for long videos.
 * Retrospective study: run on archived procedures that had a PCCRC or a surveillance finding and measure what SecondLook would have flagged.
 
-**Phase 3 — characterisation and regulated release.**
-* CADx head (adenoma vs. hyperplastic; NICE/JNET-style features; Paris morphology), trained on histology-confirmed data.
+**Phase 3 — validated characterisation and regulated release.**
+* The CADx pipeline exists as a research feature (benign / precancerous / cancerous, calibrated, with abstention and explanation). Still to do: train on histology-confirmed data (SUN, PICCOLO, REAL-Colon, partner data with a targeted cancer collection), validate externally per lesion on full recordings, test diminutive rectosigmoid polyps against the ASGE PIVI thresholds, and run a reader study against endoscopists ([DIAGNOSIS.md](DIAGNOSIS.md)).
+* Converter from exported review decisions with histology to training rows; finer outputs (subtype, Paris morphology, suspected deep invasion) only once there is data to validate them.
+* Separate capsule classifier.
+* Classify lesions from native-resolution frames (re-decode the selected frames instead of using the 512 px working copy), training at the same resolution, so small lesions keep their surface detail. Also gate characterisation on detector confidence or add a "not a lesion" class, so false detections do not get a category.
 * Size estimation (depth from monocular images — VR-Caps already provides depth ground truth).
 * Location / coverage mapping (which segments were seen), building on VR-Caps pose and depth work.
-* UKCA / CE marking ([REGULATORY.md](REGULATORY.md)).
+* UKCA / CE marking ([REGULATORY.md](REGULATORY.md)); CADx as its own, higher-class claim.
 
 **Phase 4 — real-time in MADSyncro / MADAlpha.** Optimised ONNX/TensorRT models running live.
 SecondLook remains the offline QA and training-data hub.
@@ -159,6 +182,7 @@ SecondLook remains the offline QA and training-data hub.
 ## 7. Known limitations of the prototype
 
 * The baseline heuristic detector has only been checked on synthetic data. It **will** produce false positives and misses on real footage. Use a trained model.
-* No mm size estimate, no anatomical location, no histology prediction yet.
+* No mm size estimate and no anatomical location yet.
+* No validated lesion classifier ships. Optical diagnosis needs a model trained and externally validated on histology-labelled data; models trained on the synthetic lesions only test the software.
 * DICOM and proprietary capsule formats are not read yet. Export to MP4/AVI or images first.
 * The web UI has no authentication. It is for single-user local use only.

@@ -22,6 +22,34 @@ Writing it as an offline "second reader" that only *highlights* findings (not CA
 real-time) is the lowest-risk first claim. Each later feature (malignancy risk, real time,
 autonomous capsule control) widens the intended use and needs its own conformity assessment.
 
+### Optical diagnosis (CADx) claim
+
+The prototype now contains a research CADx feature. It predicts whether each detected lesion
+is benign, precancerous or cancerous ([DIAGNOSIS.md](DIAGNOSIS.md)). It is **not part of the
+first claim** and is for research use only. It is a separate, higher-risk claim:
+
+* A detection-only second look asks a clinician to look again. A category such as "benign" can
+  directly inform a decision to leave a polyp in place, discard it without histology, or refer
+  for surgery.
+* EU MDR Annex VIII Rule 11 places decision-informing software in class IIa. It is IIb where a
+  wrong decision could cause serious deterioration of health or a surgical intervention, and
+  III where it could cause death or irreversible deterioration. A cancer called benign is
+  such a risk, so the working assumption for a CADx claim is **class IIb or higher**. The
+  class follows from the final intended use and must be agreed with the Notified Body
+  (Approved Body for GB). MDCG 2019-11 gives guidance on qualifying and classifying software.
+* It needs its own intended use, risk analysis, usability work, clinical evaluation and
+  conformity assessment. Evidence should be per lesion on recorded procedures with
+  histology, from external sites and devices, benchmarked against endoscopists (for
+  diminutive polyps, against ASGE PIVI and current ESGE / BSG standards).
+
+**Draft intended use for a later CADx claim (to refine):**
+> SecondLook optical diagnosis is software intended to assist qualified healthcare
+> professionals reviewing recorded lower-GI colonoscopy video, by giving a prediction of the
+> likely histology category (non-neoplastic, neoplastic non-invasive, or suspected cancer) of
+> lesions identified in the recording, with a calibrated confidence. It does not replace
+> histopathological examination and is not intended to be used on its own to decide whether
+> a lesion is removed, sent for histology or left in place.
+
 ## 2. Likely classification
 
 | Market | Framework | Likely class (detection-only, assistive) |
@@ -31,6 +59,9 @@ autonomous capsule control) widens the intended use and needs its own conformity
 | EU AI Act | High-risk AI (medical device that needs a Notified Body) | AI Act obligations sit on top of MDR. Check application dates for Annex I products |
 | USA | FDA | Comparable colonoscopy CADe systems were cleared via De Novo / 510(k) (Class II) |
 
+The table is for the detection-only claim. A CADx claim (above) is assumed to be class IIb or
+higher in GB and the EU, and FDA routes for CADx should be checked separately.
+
 GB has been accepting CE-marked devices for a transition period. Confirm the current
 cut-off dates with MHRA, because a CE mark may be the faster route to the GB market.
 
@@ -39,8 +70,9 @@ cut-off dates with MHRA, because a CE mark may be the faster route to the GB mar
 | Requirement | Standard | Where the prototype already helps |
 |---|---|---|
 | Quality management system | ISO 13485 | Version control, tests, versioned models |
-| Software lifecycle | IEC 62304 (likely Class B) | Modular design, unit/integration tests, documented architecture (DESIGN.md) |
+| Software lifecycle | IEC 62304: likely Class B for the detection-only second look; the CADx software items are likely **Class C** (a cancer called benign can contribute to serious injury) unless histopathology confirmation is formally credited as a risk control external to the software, which the risk file must then justify | Modular design, unit/integration tests, documented architecture (DESIGN.md) |
 | Risk management | ISO 14971 | Hazards: missed lesion (false reassurance), false flag (unneeded repeat), wrong patient/recording. Mitigations: intended-use notice, blind-segment reporting, input hashing |
+| Risk management (CADx) | ISO 14971 | Hazards: cancer or adenoma called benign (false reassurance, delayed treatment); benign called cancer (unneeded referral, anxiety); automation bias, including a category shown for a false detection; use on an untested device, imaging mode or capsule data; inflated validation figures (patient leakage, train/serve resolution skew). Mitigations: off unless a model is supplied, calibrated probabilities labelled as such only when the fit succeeded, abstention (including no benign call when neoplasia is as likely), multi-frame agreement, explanation map, safety statement on every prediction, modality check, offline only, model version and file hashes in the audit log, every output stating that histopathology must confirm it |
 | Usability | IEC 62366-1 | Explanation for every flag; decision capture; formative studies with trainees and consultants |
 | Health software | IEC 82304-1 | Product-level requirements and documentation |
 | Clinical evaluation | MDR Annex XIV / MHRA guidance | Retrospective multi-centre study (DESIGN.md Phase 2), then prospective study |
@@ -62,4 +94,4 @@ The MHRA **AI Airlock** regulatory sandbox is worth applying to: it is aimed at 
 1. **Now:** research use only, on de-identified data. Set up the QMS, risk file and software development plan. Freeze the intended use.
 2. **Phase 1–2:** train and validate the detector. Retrospective clinical study under ethics approval. DCB0129 safety case.
 3. **First market:** UKCA (and/or CE under EU MDR) for detection-only offline second look.
-4. **Later:** CADx (malignancy risk) and capsule-specific claims as separate submissions; FDA once there is UK/EU evidence.
+4. **Later:** CADx (benign / precancerous / cancerous optical diagnosis) as a separate, higher-class submission with its own clinical validation; capsule-specific claims likewise; FDA once there is UK/EU evidence.
