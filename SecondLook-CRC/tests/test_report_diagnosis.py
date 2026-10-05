@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -130,11 +131,12 @@ def test_html_shows_badges_probabilities_and_explanation(classified):
     assert 'style="width:72.0%"' in f2 and 'aria-label="AI category probabilities for F002"' in f2
     assert "75% (6 of 8 frames)" in f2
     assert "occlusion sensitivity" in f2 and "not a pathology image" in f2 and "Image regions that most" in f2
-    assert "<caption>Calibrated probability per category, averaged over 8 frames</caption>" in f2
+    assert ("<caption>Probability per category, averaged over 8 frames (calibrated on the model&#x27;s own "
+            "validation data; a model output, not this patient&#x27;s risk)</caption>") in f2
 
     f1 = cards["F001"]
     assert 'class="cat benign">Benign (non-neoplastic)<' in f1
-    assert "Calibrated probability" not in f1 and "(not calibrated: read as a ranking, not as a risk)" in f1
+    assert "calibrated on the model" not in f1 and "(not calibrated: read as a ranking, not as a risk)" in f1
     assert '<td class="pct">&lt;1%</td>' in f1 and '<td class="pct">93%</td>' in f1
 
     f3 = cards["F003"]
@@ -145,7 +147,7 @@ def test_html_shows_badges_probabilities_and_explanation(classified):
     assert "Indeterminate (AI abstained)" in f5 and "classifier error (RuntimeError: boom)" in f5
 
     f4 = cards["F004"]
-    assert "AI optical diagnosis" not in f4 and "uncharacterised" in f4
+    assert "AI optical diagnosis" not in f4 and "Not characterised: no lesion classifier configured." in f4
 
 
 def test_safety_line_next_to_every_ai_diagnosis(classified):
@@ -166,6 +168,7 @@ def test_priority_list_puts_findings_without_a_category_above_benign(classified)
     # Suspected cancer, then no AI category (with an estimate first), then benign.
     assert order == ["F002", "F003", "F004", "F005", "F001"]
     assert "AI P(suspected cancer) 72%" in section and "P(neoplastic) 93%" in section
+    assert "not clinical risks" in section and "unless" not in section  # calibration does not make them risks
     assert "no AI estimate" in section and "needs human review" in section and "potentially missed" in section
     assert '<div class="tile alert"><b>1</b>suspected cancer' in html
 
@@ -239,5 +242,71 @@ def test_without_classifier_report_stays_uncharacterised(tmp_path):
     assert "AI optical diagnosis" not in html and "Priority list" not in html
     assert "suspected cancer (AI" not in html and report.AI_DIAGNOSIS_NOTICE not in html
     assert data["ai_diagnosis_notice"] is None
-    assert "No lesion classifier configured" in html
+    assert "Not characterised: no lesion classifier configured." in html
     assert "Reviewer optical diagnosis" in html  # reviewer can still record their own optical diagnosis
+
+
+@pytest.mark.parametrize("probs", [
+    {"benign": 0.45, "precancerous": 0.40, "cancerous": 0.15},  # as likely neoplastic as not
+    {"benign": 0.50, "precancerous": 0.30, "cancerous": 0.20},  # a tie is not "more likely benign"
+    {},  # nothing to check the call against
+])
+def test_report_withholds_a_benign_call_its_probabilities_do_not_support(tmp_path, probs):
+    """Characteriser is a plug-in point: the never-benign rule must hold for any of them, not only the
+    bundled ONNX classifier."""
+    c = _char("benign", probs)
+    c.abstained, c.confidence = False, probs.get("benign")
+    ok = _char("benign", {"benign": 0.55, "precancerous": 0.30, "cancerous": 0.15})
+    data = report.write(_result([_finding("F001", 5, c), _finding("F002", 15, ok)]), tmp_path)
+    first = data["findings"][0]
+    assert first["ai_category"] == "indeterminate" and data["findings"][1]["ai_category"] == "benign"
+    char = first["characterisation"]  # result.json shows no category the report withheld
+    assert char["category"] is None and char["abstained"] is True and char["withheld_category"] == "benign"
+    assert "benign" in char["abstain_reason"]
+    html_text = (tmp_path / "report.html").read_text()
+    card = _cards(html_text)["F001"]
+    assert "Indeterminate (AI abstained)" in card and "Benign (non-neoplastic)<" not in card.split("dx-cat", 1)[1][:200]
+    meta = json.loads(re.search(r"const REPORT_META=(.*?);\n", html_text).group(1))
+    assert meta["findings"]["F001"]["ai_category"] == "indeterminate"  # what review_decisions.json exports
+
+
+def test_nan_output_never_leaves_a_category_in_result_json(tmp_path):
+    nan = float("nan")
+    data = report.write(_result([_finding("F001", 5, _char("benign", {"benign": nan, "precancerous": 0.1,
+                                                                       "cancerous": 0.1}))]), tmp_path)
+    char = data["findings"][0]["characterisation"]
+    assert data["findings"][0]["ai_category"] == "indeterminate" and char["category"] is None
+    assert "not numbers" in char["abstain_reason"]
+
+
+def test_findings_of_a_refused_recording_are_marked_not_applied(tmp_path):
+    from secondlook.characterise import not_applied
+
+    class Model:
+        name, version = "colon-model", "1"
+
+    reason = "the model was trained for colonoscopy images and is not validated for capsule"
+    findings = [_finding(f"F00{i}", 5 + 10 * i, not_applied(Model(), reason)) for i in range(1, 3)]
+    data = report.write(_result(findings, characteriser="colon-model", version="1", modality="capsule",
+                                info={"unsupported_reason": reason}), tmp_path)
+    html_text = (tmp_path / "report.html").read_text()
+    for card in _cards(html_text).values():
+        assert "Not applied (no AI category)" in card and "AI abstained" not in card and reason in card
+    assert "classifier not applied (no AI category)" in html_text and "AI abstained" not in html_text
+    assert data["summary"]["ai_categories"]["indeterminate"] == 2  # still never treated as benign
+
+
+def test_cli_summary_separates_not_applied_from_abstained(capsys):
+    from secondlook.cli import _print_summary
+
+    base = {"frames_analysed": 10, "frames_informative": 9, "runtime_s": 1.0, "findings": 2, "report_supplied": False,
+            "potentially_missed": 0, "blind_segments": 0, "blind_time_s": 0.0,
+            "ai_categories": {"benign": 0, "precancerous": 0, "cancerous": 0, "indeterminate": 2, "uncharacterised": 0}}
+    findings = [{"characterisation": {"model": "m", "model_version": "1"}}] * 2
+    _print_summary({"summary": base, "findings": findings,
+                    "characteriser": {"unsupported_reason": "not validated for capsule"}}, Path("out"))
+    out = capsys.readouterr().out
+    assert "No AI category (classifier not applied): 2" in out and "uncertain" not in out and "Benign" not in out
+    _print_summary({"summary": base, "findings": findings, "characteriser": {"calibrated": True}}, Path("out"))
+    out = capsys.readouterr().out
+    assert "No AI category (uncertain): 2" in out and "not risks for your patients" in out

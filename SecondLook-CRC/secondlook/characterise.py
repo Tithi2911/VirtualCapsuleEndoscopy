@@ -6,7 +6,7 @@ one, makes the prediction more stable and lets the classifier report how much
 the frames agree.
 
 Without a trained classifier the NullCharacteriser is used and every lesion is
-reported as uncharacterised. Optical diagnosis is the clinically riskiest output
+reported as "Not characterised". Optical diagnosis is the clinically riskiest output
 of this software and must never be produced by an untrained rule. See
 secondlook/diagnosis/ and docs/DIAGNOSIS.md.
 """

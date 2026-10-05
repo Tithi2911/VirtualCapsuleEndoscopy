@@ -14,7 +14,10 @@ answer is worse than an abstention. So this module reports:
   model answers for, how accurate it is on those, the neoplastic NPV of the
   benign calls it actually makes, and where every cancer ended up;
 * patient-grouped bootstrap confidence intervals, because lesions from one
-  patient are not independent.
+  patient are not independent. When no errors are observed every resample gives
+  the same value and a percentile interval would read [100%-100%]; proportions
+  then get an exact (Clopper-Pearson) interval over patients instead, and the
+  other metrics are marked as not estimable.
 
 Everything returned is JSON-serialisable (floats, ints, lists, None). A metric
 that cannot be computed, such as AUROC for a class with no positives, is None
@@ -352,6 +355,12 @@ def _percentile_ci(values: list[float], alpha: float) -> tuple[Optional[float], 
     return float(lo), float(hi)
 
 
+def exact_all_or_none_ci(n: int, all_successes: bool, alpha: float = 0.05) -> tuple[float, float]:
+    """Clopper-Pearson interval for n successes out of n (or none out of n)."""
+    bound = (alpha / 2) ** (1.0 / n)
+    return (bound, 1.0) if all_successes else (0.0, 1.0 - bound)
+
+
 def bootstrap_ci(
     y_true,
     probs,
@@ -371,6 +380,12 @@ def bootstrap_ci(
     abstentions excluded), as in `selective`; without it, P(neoplastic) >= 0.5 over
     all lesions. Replicates in which a metric is undefined (for example no
     negatives) are skipped and counted in `n_valid`.
+
+    With no errors (or no correct results) every resample gives the same value, so the
+    percentile interval collapses to a point. Accuracy and neoplastic NPV then get the
+    exact Clopper-Pearson interval with each patient that contributes to the metric as
+    one trial ("method": "exact"); balanced accuracy and macro AUROC get no interval
+    (low and high None) and a "note" saying why.
     """
     classes = list(classes)
     k = len(classes)
@@ -379,6 +394,14 @@ def bootstrap_ci(
     if g.shape[0] != y.shape[0]:
         raise ValueError(f"{y.shape[0]} labels but {g.shape[0]} group ids")
     neo = _neoplastic_index(classes)
+
+    def npv_rows(yy: np.ndarray, pp: np.ndarray) -> np.ndarray:
+        """Rows in the NPV denominator: the lesions called (or predicted) benign."""
+        if neo is None:
+            return np.zeros(yy.shape, bool)
+        if abstain_below is None:
+            return pp[:, neo[1]].sum(axis=1) < NEOPLASTIC_THRESHOLD
+        return decide(pp, abstain_below, classes) == neo[0]
 
     def npv(yy: np.ndarray, pp: np.ndarray) -> Optional[float]:
         if neo is None:
@@ -410,9 +433,28 @@ def bootstrap_ci(
 
     out = {"method": "patient-grouped percentile bootstrap", "n_resamples": int(n), "n_groups": len(members),
            "confidence": 1 - alpha, "seed": int(seed),
+           "degenerate_rule": "no errors observed: exact Clopper-Pearson interval over patients for accuracy and "
+                              "neoplastic NPV, no interval for the other metrics",
            "neoplastic_npv_rule": "P(neoplastic) >= 0.5, all lesions" if abstain_below is None
            else f"deployed decision at abstain_below {abstain_below}, answered lesions"}
+    # Patients that contribute to each proportion: one trial each for the exact interval.
+    units = {"accuracy": len(members),
+             "neoplastic_npv": len(np.unique(g[npv_rows(y, p)])) if y.size else 0}
     for metric, value in point.items():
-        lo, hi = _percentile_ci(samples[metric], alpha)
-        out[metric] = {"estimate": value, "low": lo, "high": hi, "n_valid": len(samples[metric])}
+        values = samples[metric]
+        entry = {"estimate": value, "low": None, "high": None, "n_valid": len(values)}
+        if values and max(values) - min(values) <= 1e-12:  # every resample identical: the percentile CI is a point
+            extreme = value is not None and (value >= 1 - 1e-12 or value <= 1e-12)
+            if extreme and units.get(metric):
+                all_right = value >= 1 - 1e-12
+                lo, hi = exact_all_or_none_ci(units[metric], all_right, alpha)
+                entry.update(low=lo, high=hi, method="exact",
+                             note=f"no {'errors' if all_right else 'correct results'} observed; Clopper-Pearson "
+                                  f"interval over {units[metric]} patient{'s' if units[metric] != 1 else ''}")
+            else:
+                entry["note"] = ("not estimable: every resample gave the same value"
+                                 + (" (no errors observed)" if extreme else ""))
+        else:
+            entry["low"], entry["high"] = _percentile_ci(values, alpha)
+        out[metric] = entry
     return out

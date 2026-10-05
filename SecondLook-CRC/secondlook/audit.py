@@ -51,13 +51,21 @@ def append(path: Path | str, event: str, **fields) -> dict:
 
 
 def verify(path: Path | str) -> tuple[bool, str]:
+    """(intact?, message). A missing log or an unparseable line is reported, never raised."""
+    path = Path(path)
+    if not path.is_file():
+        return False, f"no audit log at {path}: nothing has been logged there yet, or the log is elsewhere"
     prev = GENESIS
     with open(path) as f:
         for n, line in enumerate(f, 1):
             if not line.strip():
                 continue
-            entry = json.loads(line)
-            stored = entry.pop("entry_hash")
+            try:
+                entry = json.loads(line)
+                stored = entry.pop("entry_hash")
+                entry["prev_hash"]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                return False, f"line {n}: not a valid audit entry (altered or truncated)"
             if entry["prev_hash"] != prev:
                 return False, f"line {n}: chain broken (previous entry missing or altered)"
             if _hash(entry) != stored:

@@ -40,8 +40,10 @@ secondlook analyse capsule_frames/ --modality capsule --image-fps 4
 # Local browser interface (localhost only)
 secondlook serve        # open http://127.0.0.1:8765
 
-# Check the audit log has not been altered
+# Check the audit log has not been altered (analyse logs to ~/.secondlook/audit.jsonl;
+# demo and serve keep their own logs, see Outputs)
 secondlook audit-verify
+secondlook audit-verify --log demo_output/audit.jsonl
 ```
 
 The procedure report is a simple JSON list of the lesions the endoscopist found, by time or
@@ -77,8 +79,9 @@ category the pathologist is likely to report for each finding:
 
 It averages probabilities over up to eight frames of the lesion and abstains when confidence or
 frame agreement is low, when it would otherwise call a lesion benign that is as likely
-neoplastic, or when some frames confidently suggest a higher-risk category. Probabilities are
-labelled calibrated only when the trainer's temperature fit succeeded. Each categorised finding
+neoplastic, or when some frames confidently suggest a higher-risk category (for a benign call,
+a single such frame is enough). Probabilities are labelled calibrated only when the trainer's
+temperature fit succeeded, and even then as model outputs, not patient risks. Each categorised finding
 gets an occlusion map showing what the decision depended on, and the report shows the model's
 file hash, training data and validation status. A "benign" (non-neoplastic) call does not take a
 polyp out of surveillance counting. No validated model ships with SecondLook, and the feature is
@@ -98,8 +101,10 @@ secondlook demo --out demo_cadx --classifier models/cadx-synth/model.onnx   # on
 python training/train_classifier.py --data data/piccolo --data data/centre_a --out models/lesion_cls \
     --backbone resnet18 --weights weights/resnet18-f37072fd.pth    # or --pretrained when online
 #   --modality colonoscopy (default) or capsule: a model is only applied to recordings of its modality
+#   Share only model.onnx + model.json; the other files in --out are derived from patient data
 
-# External validation on a centre the model has never seen (warns on any overlap with its development data)
+# External validation on a centre the model has never seen. Warns on the overlap with its development
+# data that it can detect: same folder, a copied labels.csv, shared patient IDs or byte-identical images
 python training/train_classifier.py --evaluate-only models/lesion_cls/model.onnx \
     --data data/centre_b --out reports/centre_b
 
@@ -122,7 +127,8 @@ known failure modes and the regulatory impact.
 | `report.html` | Self-contained clinician report (images embedded, no server needed) with second-reader controls |
 | `result.json` | Machine-readable results for research and audit |
 | `findings/F001_overlay.png` … | Heatmap+outline, original frame and filmstrip for each finding; `F001_diagnosis.png` is the classifier's explanation map |
-| `~/.secondlook/audit.jsonl` | Hash-chained log: user, time, input SHA-256, model version, summary |
+| `~/.secondlook/audit.jsonl` | Hash-chained audit log of `secondlook analyse` (or `--audit-log PATH`): user, time, input SHA-256, model versions and hashes, summary |
+| `~/.secondlook/runs/audit.jsonl` | The same for analyses run through `secondlook serve` (`<data-dir>/audit.jsonl`); `secondlook demo` logs to `<out>/audit.jsonl`. Check any of them with `secondlook audit-verify --log PATH` |
 
 ## Documentation
 

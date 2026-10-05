@@ -56,6 +56,8 @@ CATEGORY_LABEL = {
     INDETERMINATE: "Indeterminate (AI abstained)",
     UNCHARACTERISED: "Not characterised",
 }
+# Badge for INDETERMINATE findings of a recording the classifier was not applied to at all.
+NOT_APPLIED_LABEL = "Not applied (no AI category)"
 
 AI_DIAGNOSIS_NOTICE = (
     "AI optical diagnosis predicts histology from the endoscopic image; it is not a histological "
@@ -63,6 +65,10 @@ AI_DIAGNOSIS_NOTICE = (
     "Confirm with histopathology. The AI gives a category to every detection, including ones that are "
     "not lesions: first decide whether the finding is a lesion at all."
 )
+
+# Example shown in the histology field; exported histology becomes training labels, so it must be
+# a label train_classifier.py accepts (taxonomy.category_for).
+HISTOLOGY_EXAMPLE = "tubular adenoma, low-grade dysplasia"
 
 REVIEWER_CATEGORY_OPTIONS = [
     ("", "Not assessed"),
@@ -104,24 +110,64 @@ def _numbers_ok(c: Characterisation) -> bool:
     return all(v is None or _finite(v) for v in values)
 
 
+def _benign_supported(c: Characterisation) -> bool:
+    """The deployed rule (metrics.decide) for any characteriser, not only the bundled one: a lesion is
+    called benign only when P(benign) > P(precancerous) + P(cancerous), which needs all three numbers."""
+    p = c.probabilities or {}
+    if not all(k in p and _finite(p[k]) for k in CATEGORIES):
+        return False
+    return float(p["benign"]) > float(p["precancerous"]) + float(p["cancerous"])
+
+
 def ai_category(c: Characterisation) -> str:
-    """The finding's AI category, INDETERMINATE if the model abstained, or UNCHARACTERISED if none ran."""
+    """The finding's AI category, INDETERMINATE if the model abstained, or UNCHARACTERISED if none ran.
+    A benign category that its own probabilities do not support is INDETERMINATE too."""
     if not c.model:
         return UNCHARACTERISED
     if c.abstained or not c.category or not _numbers_ok(c):
         return INDETERMINATE
     try:
-        return category_for(c.category).value
+        category = category_for(c.category).value
     except KeyError:
         return INDETERMINATE
+    if category == DiagnosticCategory.BENIGN.value and not _benign_supported(c):
+        return INDETERMINATE
+    return category
 
 
 def _abstain_reason(c: Characterisation) -> str:
-    if c.abstain_reason:
+    if c.abstain_reason and (c.abstained or not c.category):
         return c.abstain_reason
     if not _numbers_ok(c):
         return "the AI output contains values that are not numbers (NaN or infinity)"
-    return f"unrecognised category {c.category!r}" if c.category and not c.abstained else "no category returned"
+    if c.category and not c.abstained:
+        try:
+            benign = category_for(c.category) == DiagnosticCategory.BENIGN
+        except KeyError:
+            return f"unrecognised category {c.category!r}"
+        if benign and not _benign_supported(c):
+            p = c.probabilities or {}
+            if not all(k in p for k in CATEGORIES):
+                return "a benign category was returned without the probabilities needed to check it"
+            return (f"not called benign because P(precancerous) + P(cancerous) = "
+                    f"{float(p['precancerous']) + float(p['cancerous']):.2f} is not below P(benign) = "
+                    f"{float(p['benign']):.2f}")
+    return c.abstain_reason or "no category returned"
+
+
+def _characterisation_json(c: Characterisation, cat: str) -> dict:
+    """The characterisation as stored in result.json. When the report withholds the category, so does
+    the JSON (category None, abstained), so no consumer reads a category the report did not show; the
+    characteriser's own value is kept as `withheld_category` for audit."""
+    d = to_jsonable(c)
+    if cat == INDETERMINATE and (d.get("category") or not d.get("abstained")):
+        d.update(withheld_category=d.get("category"), category=None, abstained=True, abstain_reason=_abstain_reason(c))
+    return d
+
+
+def classifier_not_applied(result: AnalysisResult) -> bool:
+    """True when the classifier refused this recording (modality or working size), so no finding was classified."""
+    return bool((result.characteriser_info or {}).get("unsupported_reason"))
 
 
 def _strict(obj):
@@ -182,7 +228,7 @@ def result_dict(result: AnalysisResult) -> dict:
                 "evidence": f.best.evidence,
                 "rationale": f.rationale,
                 "ai_category": cat,
-                "characterisation": to_jsonable(f.characterisation),
+                "characterisation": _characterisation_json(f.characterisation, cat),
             }
             for f, cat in zip(result.findings, categories)
         ],
@@ -233,8 +279,9 @@ def _timeline_svg(result: AnalysisResult) -> str:
     return "".join(parts)
 
 
-def _category_badge(cat: str) -> str:
-    return f'<span class="cat {cat}">{esc(CATEGORY_LABEL[cat])}</span>'
+def _category_badge(cat: str, not_applied: bool = False) -> str:
+    label = NOT_APPLIED_LABEL if not_applied and cat == INDETERMINATE else CATEGORY_LABEL[cat]
+    return f'<span class="cat {cat}">{esc(label)}</span>'
 
 
 def _probability_table(f: Finding, cat: str) -> str:
@@ -254,7 +301,8 @@ def _probability_table(f: Finding, cat: str) -> str:
         return ""
     over = f", averaged over {c.frames_used} frame{'s' if c.frames_used != 1 else ''}" if c.frames_used else ""
     label = f"AI category probabilities for {f.finding_id}"
-    caption = (f"Calibrated probability per category{over}" if c.calibrated is True else
+    caption = (f"Probability per category{over} (calibrated on the model's own validation data; a model output, "
+               "not this patient's risk)" if c.calibrated is True else
                f"Model probability per category{over} (not calibrated: read as a ranking, not as a risk)")
     return (
         f'<table class="probs" aria-label="{esc(label)}"><caption>{esc(caption)}</caption>'
@@ -323,7 +371,7 @@ def _diagnosis_block(result: AnalysisResult, f: Finding) -> str:
     return f"""
   <section class="dx" aria-labelledby="dx-{fid}">
     <h4 id="dx-{fid}">AI optical diagnosis</h4>
-    <p class="dx-cat">{_category_badge(cat)}</p>
+    <p class="dx-cat">{_category_badge(cat, classifier_not_applied(result))}</p>
     {lead}
     <div class="dx-body">
       <div>{_probability_table(f, cat)}{_diagnosis_facts(c, cat)}</div>
@@ -363,7 +411,7 @@ def _finding_card(result: AnalysisResult, f: Finding) -> str:
       <label class="field">Reviewer optical diagnosis
         <select name="rc-{fid}" class="reviewer-category">{options}</select></label>
       <label class="field">Histology result (when available)
-        <input type="text" name="h-{fid}" class="histology" autocomplete="off" placeholder="e.g. tubular adenoma, low-grade dysplasia"></label>
+        <input type="text" name="h-{fid}" class="histology" autocomplete="off" placeholder="e.g. {esc(HISTOLOGY_EXAMPLE)}"></label>
     </div>
     <textarea name="c-{fid}" placeholder="Comment (location, size, Paris class, action)"></textarea>
   </fieldset>
@@ -409,13 +457,13 @@ def _priority_list(result: AnalysisResult) -> str:
             parts.append("<b>potentially missed</b>")
         items.append(
             f'<li><a href="#{fid}">{fid}</a> <span class="time">{_fmt_time(f.best.timestamp_s)}</span> '
-            f'{_category_badge(cat)} <span class="risk">{" &middot; ".join(parts)}</span></li>'
+            f'{_category_badge(cat, classifier_not_applied(result))} <span class="risk">{" &middot; ".join(parts)}</span></li>'
         )
     return f"""<h2>Priority list</h2>
 <p class="muted">Suspected cancer first, then findings without an AI category (they need human review and are
 never treated as benign), then precancerous, then benign; within each group by the AI probability of the
-suspected-cancer category. These are model outputs, not clinical risks, unless the probabilities are marked
-as calibrated.</p>
+suspected-cancer category. These are model outputs, not clinical risks. Calibration on the model's own
+validation data does not make them risks for your patients.</p>
 <ol class="priority">{"".join(items)}</ol>"""
 
 
@@ -430,10 +478,12 @@ def _classifier_section(result: AnalysisResult) -> str:
     if info.get("modalities"):
         rows.append(("Trained for", ", ".join(map(str, info["modalities"]))))
     if "calibrated" in info:
-        rows.append(("Probabilities", "calibrated on validation data (temperature scaling)" if info["calibrated"]
-                     else "not calibrated"))
+        rows.append(("Probabilities", "calibrated on the model's own validation data (temperature scaling); model "
+                     "outputs, not risks for your patients" if info["calibrated"] else "not calibrated"))
     if info.get("training_data"):
         rows.append(("Training data", ", ".join(map(str, info["training_data"]))))
+    if info.get("init_training_data"):
+        rows.append(("Fine-tuned from a model trained on", ", ".join(map(str, info["init_training_data"]))))
     if info.get("validation_status"):
         rows.append(("Validation status", str(info["validation_status"])))
     if info.get("intended_use"):
@@ -561,7 +611,8 @@ def write_html(result: AnalysisResult, data: dict, path: Path) -> None:
     if used:
         ai_tiles = (
             f'<div class="tile{" alert" if ai["cancerous"] else ""}"><b>{ai["cancerous"]}</b>suspected cancer (AI optical diagnosis)</div>'
-            f'<div class="tile"><b>{ai[INDETERMINATE]}</b>indeterminate (no AI category)</div>'
+            f'<div class="tile"><b>{ai[INDETERMINATE]}</b>'
+            f'{"classifier not applied" if classifier_not_applied(result) else "indeterminate"} (no AI category)</div>'
         )
         ai_notice = f'<div class="notice">{esc(AI_DIAGNOSIS_NOTICE)}</div>'
         sha = (result.characteriser_info or {}).get("sha256")

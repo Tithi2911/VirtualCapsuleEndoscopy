@@ -48,7 +48,9 @@ AI call does not take a lesion out of that count. Check the current version of t
 
 The mapping lives in `secondlook/diagnosis/taxonomy.py` (`HISTOLOGY_TO_CATEGORY`,
 `category_for()`), so training labels can be written as histology text ("tubular adenoma",
-"SSL", "adenocarcinoma") or as category names. An unknown label stops training with a list of
+"SSL", "adenocarcinoma"), with or without a dysplasia grade as pathology reports give it
+("tubular adenoma, low-grade dysplasia", "SSL with dysplasia"; dysplasia never maps below
+precancerous), or as category names. An unknown label stops training with a list of
 the offending values rather than being guessed. Some labels are deliberately left out so that
 a person decides: "neoplastic" alone could be an adenoma or a carcinoma, and a lipoma is a
 benign mesenchymal neoplasm, so it fits neither "non-neoplastic" nor "precancerous" (exclude
@@ -87,7 +89,8 @@ stay empty today.
                      │       frame agreement, neoplasia risk, malignancy risk (mean and peak)
                      ▼
    abstain?  top probability < abstain_below, benign but P(neoplastic) >= P(benign),
-             frames disagree, or several frames confidently higher-risk ─▶ "Indeterminate"
+             frames disagree, several frames (for a benign call, any one frame)
+             confidently higher-risk ─▶ "Indeterminate"
                      │
                      ▼
    occlusion-sensitivity map on the best frame's crop ─▶ findings/F001_diagnosis.png
@@ -136,12 +139,15 @@ stay empty today.
    At inference the probabilities are `softmax(logits / T)`. The report shows them as
    numbers, not just colours. If every validation image is already classified correctly,
    no temperature can be estimated (the fit would sharpen without limit), so the trainer
-   keeps T = 1 and warns: a bigger or harder validation set is needed. In that case, or
-   when the fit hits its search limit, the sidecar says `"calibrated": false`, and the
-   report labels the numbers "Model probability (not calibrated)" instead of "Calibrated
-   probability". A sidecar without `"calibrated": true` is always treated as uncalibrated.
-   Calibration holds for the class mix of the training data; a population with a different
-   mix (screening rather than symptomatic, say) shifts it.
+   keeps T = 1 and warns: a bigger or harder validation set is needed. In that case, when
+   the fit hits its search limit, or when the validation split has no example of a class
+   (the temperature and the best epoch were then chosen without it), the sidecar says
+   `"calibrated": false`, and the report labels the numbers "Model probability (not
+   calibrated)" instead of "Probability per category, calibrated on the model's own
+   validation data". A sidecar without `"calibrated": true` is always treated as
+   uncalibrated. Calibration holds for the class mix of the training data; a population
+   with a different mix (screening rather than symptomatic, say) shifts it. Even calibrated
+   probabilities are model outputs, not risks for a given patient, and the report says so.
 5. **Aggregation.** Probabilities are averaged over the frames used; frames whose model
    output is not a finite number are dropped first. The predicted category is the one with
    the highest mean probability. The finding also records the confidence (that probability),
@@ -158,18 +164,25 @@ stay empty today.
    * at least two frames, and at least a quarter of them, each confidently give a
      *higher-risk* category than the average (for example two of eight frames calling
      suspected cancer while the average says precancerous), because averaging would
-     otherwise hide them;
+     otherwise hide them. For a **benign** call one such frame is enough: a single frame
+     confidently calling precancerous or suspected cancer withholds "benign", on a track of
+     any length (colonoscopy tracks can be as short as 3 frames, capsule tracks 2);
    * the model returned NaN or infinity for any frame;
    * the model is not meant for this recording: its sidecar `modality` (default
      colonoscopy) differs from the analysis modality, or frames are analysed at a smaller
-     working size than it was trained at. Every finding is then indeterminate and the CLI
-     and report say why.
+     working size than it was trained at. The model then does not run at all: every finding
+     is shown as "Not applied (no AI category)" (counted with the indeterminate findings in
+     `result.json`), and the CLI and report say why.
 
    If the classifier fails on a finding (for example an unreadable frame), that finding is
    reported as indeterminate with the error, and the rest of the analysis continues. An
    indeterminate lesion still needs a human decision; it is never treated as benign.
    `metrics.decide()` implements the per-image part of this rule, and the trainer's headline
-   figures use it, so they describe the decisions the report actually shows.
+   figures use it, so they describe the decisions the report actually shows. The report
+   applies the never-benign rule again to whatever characteriser produced the category (the
+   `Characteriser` interface is a plug-in point): a "benign" whose own probabilities do not
+   give P(benign) > P(precancerous) + P(cancerous), or that comes without them, is shown as
+   indeterminate, and `result.json` then carries no category for it either.
 7. **Explanation.** For each categorised finding the classifier computes an
    occlusion-sensitivity map on the crop from the best frame. Square patches (about a
    seventh of the crop, half-overlapping) are filled with the median colour of the crop's
@@ -223,15 +236,22 @@ provenance.
 | `temperature`, `temperature_fitted`, `calibrated` | Temperature used, the value the fit found, and whether the fit succeeded. Only `"calibrated": true` makes the report call the probabilities calibrated |
 | `class_weights`, `logit_adjustment` | Training loss weights and the offset already added to the exported logits to undo their prior shift |
 | `abstain_below`, `min_frame_agreement` | Abstention thresholds (defaults 0.6 and 0.5; `abstain_below` must be at least 0.5) |
-| `output` | `"logits"` (or `"probabilities"`) |
-| `backbone`, `training_data` (absolute paths), `training_datasets` (path, labels.csv SHA-256, rows, synthetic or not), `synthetic_training_data`, `split_sizes`, `created_utc` | Provenance |
-| `development_patients` | Salted, truncated SHA-256 hashes of every patient ID in train, validation and test (and of patients an `--init` checkpoint was trained on), so `--evaluate-only` can detect overlap. The pseudonymous IDs themselves are not stored, but treat the file as derived from patient data |
+| `output` | `"logits"` or `"probabilities"` (case-insensitive); any other value is refused, and a `"probabilities"` model must return values in [0, 1] that sum to 1 |
+| `backbone`, `training_data` (absolute paths), `training_datasets` (path, labels.csv SHA-256, rows, synthetic or not), `init_training_datasets` (the same for the data an `--init` checkpoint and its ancestors were trained on; the report shows them as "Fine-tuned from a model trained on"), `synthetic_training_data`, `split_sizes`, `created_utc` | Provenance |
 | `metrics`, `validation_warnings` | Validation and test metrics (section 5) and the trainer's warnings, shown in the report |
 | `external_validation` | Optional, added by hand after an external evaluation (for example "centre B, 2026, n=412"); shown in the report |
 | `intended_use` | The research-use warning that travels with the model, shown in the report |
 
+The sidecar carries no patient IDs or hashes of them. Salted, truncated SHA-256 hashes of
+every development patient ID and image file (train, validation and test, plus what an
+`--init` checkpoint was trained on) go to a separate `model.development.json`, which
+`--evaluate-only` reads when it sits next to the model. Keep that file with the data
+owner: a salt does not protect short IDs (hospital numbers, `P001`), which can be
+recovered by hashing every possible ID.
+
 All values are checked when the model is loaded: a NaN or out-of-range temperature or
-threshold is refused rather than used.
+threshold, or an unknown `output` kind, is refused rather than used. A model exported with a
+fixed batch size is run in chunks of that size, the last chunk padded.
 
 ## 3. Data needed
 
@@ -290,9 +310,12 @@ Each dataset directory passed with `--data` contains a `labels.csv`:
 | `x`, `y`, `w`, `h` | optional | Lesion box in pixels, instead of a mask |
 | `split` | optional | `train`, `val` or `test`; overrides the automatic split |
 
-Rows with neither mask nor box use the whole image. The same `patient_id` in two `--data`
-directories is treated as one patient, so data sets that share patients cannot leak across
-the split; give each source its own ID prefix if the IDs are unrelated. Other columns are
+Rows with neither mask nor box use the whole image. Patient IDs are compared ignoring case
+and surrounding spaces, and the same `patient_id` in two `--data` directories is treated as
+one patient, so data sets that share patients cannot leak across the split; give each
+source its own ID prefix if the IDs are unrelated. A row without a `patient_id` is its own
+unit, identified by the content of its image file (so identical files stay together, and a
+moved or copied data set is still recognised). Other columns are
 ignored by the trainer but kept useful: add `lesion_id`, `size_mm`, `segment`, `imaging_mode`, `device` and `centre`
 so results can be broken down later.
 
@@ -314,7 +337,9 @@ white-light appearance:
 * **cancerous:** large and ragged, with a fibrin-covered central ulcer.
 
 A share of lesions is drawn part-way towards a neighbouring category, as real lesions overlap
-in appearance. Each synthetic patient is photographed several times. This is for testing the
+in appearance. Each synthetic patient is photographed several times. Patient IDs carry the
+seed (`SYN<seed>-00001`; `--patient-prefix` sets another prefix), so sets drawn with
+different seeds are never taken for the same patients. This is for testing the
 software and, at most, for pre-training. The realistic synthetic source is VR-Caps and
 MADSyncro renders with lesion materials labelled by category ([DATASETS.md](DATASETS.md)).
 `synthetic.generate(..., lesion_kinds=["benign", "precancerous", "cancerous"])` renders a
@@ -344,9 +369,10 @@ python training/train_classifier.py --data data/piccolo --data data/sun --data d
     --out models/lesion_cls --name crc-cadx --version 2026.10.0
 #    --modality colonoscopy is the default; a capsule model needs --modality capsule and capsule data.
 #    Optional: fine-tune an earlier checkpoint of the same backbone (e.g. synthetic or VR-Caps
-#    pre-training, or the previous release) with --init models/<previous>/best.pt. Patients that
-#    checkpoint was trained on (recorded as hashes in best.pt) are kept in the training split, so
-#    they cannot inflate validation or test figures; a split column that puts them elsewhere is refused.
+#    pre-training, or the previous release) with --init models/<previous>/best.pt. Patients and
+#    images that checkpoint was trained on (recorded as hashes in best.pt) are kept in the training
+#    split, so they cannot inflate validation or test figures; a split column that puts them
+#    elsewhere is refused.
 
 # 3. External validation on a centre or device never used for training or model selection.
 python training/train_classifier.py --evaluate-only models/lesion_cls/model.onnx \
@@ -358,25 +384,36 @@ secondlook serve --classifier models/lesion_cls/model.onnx     # local web inter
 ```
 
 Training writes `model.onnx`, `model.json`, `best.pt` (checkpoint for `--init`),
-`metrics.json`, `predictions_test.csv` and `split.json` into `--out`. Every reported number
+`model.development.json` (hashed development patients and images), `metrics.json`,
+`predictions_test.csv` and `split.json` into `--out`. **Distribute only `model.onnx` and
+`model.json`.** The other files are derived from patient data: `split.json` and
+`predictions_test.csv` list pseudonymous patient IDs and image paths, `best.pt` and
+`model.development.json` hold salted hashes of them, and `--evaluate-only` output
+(`metrics.json`, `predictions.csv`) names the evaluation data's patients too. Every reported number
 comes from the exported ONNX model after calibration, that is from what will actually be
 deployed. Without `--version` the version is the UTC creation time, so two training runs
 never share a name and version; the report, result JSON and audit log also record the
 SHA-256 of `model.onnx` and `model.json`. `--evaluate-only` writes `metrics.json` and
 `predictions.csv`. It warns, and records the overlap in `metrics.json`, when the evaluation
-data share a directory, an identical `labels.csv` (a copy) or patients with the model's
-development data, wherever the command is run from. It cannot certify that data are
-external: that depends on where they came from. Other options: `--size` (default 224),
+data share a directory or an identical `labels.csv` (a copy) with the model's development
+data or its `--init` checkpoint's, or, using `model.development.json`, patients (IDs
+compared ignoring case) or byte-identical image files, wherever the command is run from.
+Without `model.development.json` only directories and `labels.csv` files are compared; rows
+without a `patient_id` are compared by image content only, which misses a re-encoded,
+resized or cropped copy. It cannot certify that data are external: that depends on where
+they came from. Other options: `--size` (default 224),
 `--epochs`, `--batch`, `--lr`, `--crop-margin`, `--abstain-below`, `--modality`, `--seed`,
-`--workers`; run with `--help` for the full list. Unreadable images and lesion boxes outside
-their image are reported, with every other `labels.csv` problem, before training starts.
+`--workers`; run with `--help` for the full list. Unknown labels, missing or unreadable
+files, lesion boxes outside their image and invalid splits are all reported together, in one
+error, before training starts.
 
 ## 5. Evaluation
 
 **Split by patient, validate externally.** Frames of one lesion are near-duplicates. If they
 fall on both sides of a split, scores are inflated. The automatic split (70/15/15) keeps each
 `patient_id` in one part and balances the class mix; `split.json` records it. Rows without a
-`patient_id` are treated as separate patients, which is only safe for one image per lesion.
+`patient_id` are each treated as a separate patient (identical image files excepted), which
+is only safe for one image per lesion.
 The validation set is used for model selection and calibration, so it is not a test set.
 Claims need an **external** test set: another centre, endoscope vendor or time period,
 evaluated once with `--evaluate-only`.
@@ -396,7 +433,7 @@ the effect of detector errors, and abstention rates on real video.
 | Neoplastic vs benign at P(neoplastic) >= 0.5, and cancer vs rest at the argmax, over **all** lesions including those the model abstains on; AUROC | Shows what the probabilities alone would do, without abstention |
 | Expected calibration error (ECE) and reliability bins | Probabilities are shown to clinicians, so they must mean what they say |
 | Coverage table for thresholds 0.5 to 0.9 | How often the model answers, and how good it is when it does. Use the table to choose `abstain_below` on validation data. Thresholds below 0.5 are not offered: they could call a lesion benign that the model rates more likely neoplastic |
-| Patient-grouped bootstrap 95% confidence intervals (accuracy, balanced accuracy, macro AUROC, and the neoplastic NPV of the deployed decision) | Small test sets give wide intervals; report them |
+| Patient-grouped bootstrap 95% confidence intervals (accuracy, balanced accuracy, macro AUROC, and the neoplastic NPV of the deployed decision). With no errors observed every resample is identical and a percentile interval would read [100%-100%]; accuracy and NPV then get an exact (Clopper-Pearson) interval with one trial per patient (6 of 6 patients correct: 54.1% to 100%), and the other metrics are marked "not estimable" | Small test sets give wide intervals; report them |
 
 **Clinical benchmarks.** Clinicians judge optical diagnosis against published thresholds,
 which are defined for specific situations:
@@ -427,7 +464,7 @@ internal-validation figure as meeting any benchmark.
 | Measure | What it guards against |
 |---|---|
 | **Optical diagnosis is opt-in** (`--classifier`). Without a model every finding is "Not characterised" | An untrained rule producing a diagnosis |
-| **Calibrated probabilities, shown as numbers**, with the class-weight prior shift removed; labelled "not calibrated" whenever the temperature fit failed | Over-confident outputs; inflated cancer probabilities; colour-only displays; uncalibrated numbers read as risks |
+| **Calibrated probabilities, shown as numbers**, with the class-weight prior shift removed; labelled "not calibrated" whenever the temperature fit failed or the validation data lacked a class, and as model outputs rather than patient risks even when calibrated | Over-confident outputs; inflated cancer probabilities; colour-only displays; model outputs read as a patient's risk |
 | **Abstention** on low confidence, frame disagreement, a benign call that is not more likely than neoplasia, a confident higher-risk minority of frames, or non-finite model output, with the reason shown | A confident-looking guess; an indeterminate or broken output being read as benign |
 | **Multi-frame aggregation and frame agreement** | One unlucky frame (glare, blur, oblique view) deciding the category |
 | **Model checks at load time**: sidecar values finite and in range, ONNX shapes matching the sidecar, one test run; **modality and working-size check** per recording | A misconfigured or mismatched model producing confident wrong categories; a colonoscopy model used on capsule studies |
@@ -437,7 +474,7 @@ internal-validation figure as meeting any benchmark.
 | **Conservative handling of risk order** (benign < precancerous < cancerous): ambiguous histology maps upwards (intramucosal carcinoma → cancerous); metrics headline cancer sensitivity and neoplastic NPV; uncertain predictions are withheld, never defaulted to benign | Under-calling, the error with the worst consequences |
 | **Offline only**: never shown during a procedure in this version | Real-time decisions (leave in place, discard, change of technique) based on an unvalidated model |
 | **Traceability**: model name, version and SHA-256 of both model files in the report, result JSON and audit log; a unique default version per training run; training data fingerprints, split, metrics, warnings and validation status in the sidecar and the report | Not knowing which model produced an output, or how far it was validated |
-| **No patient leakage on retraining**: `--init` keeps the checkpoint's training patients in train; `--evaluate-only` detects overlap by path, `labels.csv` content and patient | Inflated validation and test figures |
+| **No patient leakage on retraining**: `--init` keeps the checkpoint's training patients and images in train, however the data set was moved; `--evaluate-only` detects overlap by path, `labels.csv` content (the `--init` checkpoint's data included), patient ID and image content | Inflated validation and test figures |
 | **Failure isolation**: a classifier error on one finding makes that finding indeterminate and the analysis continues | One bad frame hiding the rest of the review |
 
 ### Known failure modes

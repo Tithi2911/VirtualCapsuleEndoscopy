@@ -19,8 +19,8 @@ abstention cannot be tested.
 
 Output (in --out), in the format training/train_classifier.py reads:
 
-    images/SYN00001_v1.png ...   lesion photographs
-    masks/SYN00001_v1.png ...    lesion masks (white = lesion)
+    images/SYN0-00001_v1.png ... lesion photographs (patient SYN<seed>-00001, view 1)
+    masks/SYN0-00001_v1.png ...  lesion masks (white = lesion)
     labels.csv                   image,label,patient_id,mask,appearance (typical / atypical)
     dataset.json                 what was generated
 
@@ -50,6 +50,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--atypical-fraction", type=float, default=0.15,
                     help="share of lesions drawn part-way towards a neighbouring category (0-1)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--patient-prefix", help="patient ID prefix (default SYN<seed>-, so sets made with different "
+                                             "seeds never share patient IDs)")
     args = ap.parse_args(argv)
     if args.n_per_class < 1 or args.views_per_lesion < 1:
         ap.error("--n-per-class and --views-per-lesion must be at least 1")
@@ -57,10 +59,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("--size must be at least 64")
     if not 0 <= args.atypical_fraction <= 1:
         ap.error("--atypical-fraction must be between 0 and 1")
+    if args.patient_prefix is not None and not all(c.isalnum() or c in "-_" for c in args.patient_prefix):
+        ap.error("--patient-prefix may only contain letters, digits, '-' and '_'")
 
     started = time.perf_counter()
     summary = generate_lesion_dataset(args.out, args.n_per_class, args.views_per_lesion,
-                                      (args.size, args.size), args.seed, atypical_fraction=args.atypical_fraction)
+                                      (args.size, args.size), args.seed, atypical_fraction=args.atypical_fraction,
+                                      patient_prefix=args.patient_prefix)
     print(f"Wrote {summary['images']} images of {summary['patients']} synthetic lesions to {args.out} "
           f"in {time.perf_counter() - started:.1f} s")
     for category, counts in summary["per_class"].items():

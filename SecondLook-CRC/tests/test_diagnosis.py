@@ -50,6 +50,14 @@ SIDECAR_KEYS = {
         ("adenocarcinoma", "cancerous"),
         ("Intramucosal carcinoma", "cancerous"),
         ("CANCEROUS", "cancerous"),
+        # Pathology-report phrasing with a dysplasia grade (the report's own placeholder among them).
+        ("tubular adenoma, low-grade dysplasia", "precancerous"),
+        ("tubular adenoma with low-grade dysplasia", "precancerous"),
+        ("Tubulovillous adenoma with high-grade dysplasia", "precancerous"),
+        ("adenoma with high-grade dysplasia", "precancerous"),
+        ("SSL with dysplasia", "precancerous"),
+        ("hyperplastic polyp with dysplasia", "precancerous"),  # dysplasia is never benign
+        ("adenocarcinoma with high grade dysplasia", "cancerous"),
     ],
 )
 def test_histology_labels_map_to_categories(label, expected):
@@ -57,10 +65,18 @@ def test_histology_labels_map_to_categories(label, expected):
 
 
 # "neoplastic" alone could be a carcinoma, and a lipoma is a (mesenchymal) neoplasm: a person decides.
-@pytest.mark.parametrize("label", ["carcinoid", "polyp", "", "adenoma?", "neoplastic", "lipoma"])
+@pytest.mark.parametrize("label", ["carcinoid", "polyp", "", "adenoma?", "neoplastic", "lipoma",
+                                   "hyperplastic polyp, no dysplasia", "lipoma with dysplasia", "dysplasia",
+                                   "adenoma, negative for high grade dysplasia"])
 def test_unknown_label_raises(label):
     with pytest.raises(KeyError):
         category_for(label)
+
+
+def test_report_histology_placeholder_is_a_valid_label():
+    from secondlook import report
+
+    assert category_for(report.HISTOLOGY_EXAMPLE).value == "precancerous"
 
 
 def test_category_order_is_the_model_class_order():
@@ -212,7 +228,20 @@ def test_patient_bootstrap_ci():
     y = np.repeat([0, 1, 2], 4)
     perfect = np.eye(3)[y] * 0.9 + 0.1 / 3
     ci = metrics.bootstrap_ci(y, perfect, groups=np.arange(12) // 2, n=200, seed=1)
-    assert ci["n_groups"] == 6 and ci["accuracy"]["low"] == ci["accuracy"]["high"] == 1.0
+    # No errors: the percentile interval would be [100%, 100%]; an exact interval over the 6 patients is used.
+    acc = ci["accuracy"]
+    assert ci["n_groups"] == 6 and acc["method"] == "exact" and acc["high"] == 1.0
+    assert acc["low"] == pytest.approx(0.025 ** (1 / 6)) == pytest.approx(0.5407, abs=1e-4)
+    assert "no errors observed" in acc["note"] and "6 patients" in acc["note"]
+    for metric in ("balanced_accuracy", "macro_auroc"):
+        assert ci[metric]["low"] is None and ci[metric]["high"] is None and "not estimable" in ci[metric]["note"]
+    deployed = metrics.bootstrap_ci(y, perfect, groups=np.arange(12) // 2, n=200, seed=1, abstain_below=0.6)
+    npv = deployed["neoplastic_npv"]  # benign calls come from 2 patients: [0.158, 1]
+    assert npv["estimate"] == 1.0 and npv["method"] == "exact" and npv["low"] == pytest.approx(0.025 ** (1 / 2))
+    wrong = metrics.bootstrap_ci(y, np.roll(perfect, 1, axis=1), groups=np.arange(12) // 2, n=50, seed=1)
+    assert wrong["accuracy"]["estimate"] == 0.0 and wrong["accuracy"]["low"] == 0.0
+    assert wrong["accuracy"]["high"] == pytest.approx(1 - 0.025 ** (1 / 6))
+    json.dumps(ci, allow_nan=False)
     noisy = metrics.bootstrap_ci(Y, P, groups=["a", "a", "b", "c", "c", "d"], n=300, seed=1)
     acc = noisy["accuracy"]
     assert acc["low"] <= acc["estimate"] <= acc["high"] and acc["n_valid"] == 300
@@ -372,6 +401,20 @@ def test_classifier_abstains_when_some_frames_confidently_suggest_cancer(colour_
     assert one.category == "precancerous" and not one.abstained
 
 
+@pytest.mark.parametrize("n_benign", [2, 3, 5, 7])
+def test_benign_call_is_withheld_when_any_frame_confidently_suggests_neoplasia(colour_model, n_benign):
+    # Short tracks (colonoscopy keeps tracks of 3 frames, capsule of 2) must be protected too:
+    # a benign call is what leads to "leave in place".
+    benign, cancer, adenoma = [0.98, 0.01, 0.01], [0.01, 0.01, 0.98], [0.10, 0.85, 0.05]
+    c = _stubbed(colour_model, [benign] * n_benign + [cancer])
+    assert c.abstained and c.category is None and c.peak_malignancy_risk == pytest.approx(0.98)
+    assert f"1 of {n_benign + 1} frames confidently suggest a higher-risk category (Suspected cancer)" in c.abstain_reason
+    pre = _stubbed(colour_model, [benign] * n_benign + [adenoma])
+    assert pre.abstained and "(Precancerous" in pre.abstain_reason
+    unsure = _stubbed(colour_model, [benign] * n_benign + [[0.40, 0.35, 0.25]])  # not confident: no veto
+    assert unsure.category == "benign" and not unsure.abstained
+
+
 def test_classifier_abstains_on_non_finite_model_output(colour_model):
     nan = [np.nan, np.nan, np.nan]
     c = _stubbed(colour_model, [nan] * 4)
@@ -401,6 +444,69 @@ def test_classifier_rejects_invalid_sidecar_values(colour_model, sidecar, messag
     bad.with_suffix(".json").write_text(json.dumps({**meta, **sidecar}))  # json writes NaN, as a hand edit could
     with pytest.raises(ValueError, match=message):
         load_classifier(bad)
+
+
+@pytest.mark.parametrize("output", ["Logits", " LOGITS "])
+def test_sidecar_output_is_case_insensitive(colour_model, output):
+    from secondlook.diagnosis import load_classifier
+
+    exact = load_classifier(colour_model("base"), explain=False)
+    loose = load_classifier(colour_model(f"out_{output.strip()}", output=output), explain=False)
+    assert loose.output_is_logits
+    a, b = (clf.characterise(*_finding([(1, 1, 13)] * 3)) for clf in (exact, loose))
+    assert a.probabilities == pytest.approx(b.probabilities) and a.abstained == b.abstained
+
+
+@pytest.mark.parametrize("output, message", [
+    ("logit", "output must be one of"),
+    ("softmax", "output must be one of"),
+    (["logits"], "output must be one of"),
+    ("probabilities", "not a probability per class"),  # the model returns logits
+])
+def test_sidecar_output_kind_is_checked(colour_model, output, message):
+    from secondlook.diagnosis import load_classifier
+
+    with pytest.raises(ValueError, match=message):
+        load_classifier(colour_model(f"out_{output}", output=output))
+
+
+def test_probability_output_models_are_accepted(colour_model):
+    import torch
+
+    from secondlook.diagnosis import load_classifier
+
+    class Softmaxed(torch.nn.Module):
+        def forward(self, x):
+            return torch.softmax(x.mean(dim=(2, 3)) * 4.0, dim=1)
+
+    probs = load_classifier(colour_model("softmaxed", module=Softmaxed(), output="probabilities"), explain=False)
+    logits = load_classifier(colour_model("base"), explain=False)
+    for colours in ([RED] * 3, [BLUE] * 3, [GREY] * 3):
+        a, b = (clf.characterise(*_finding(colours)) for clf in (logits, probs))
+        assert a.category == b.category and a.probabilities == pytest.approx(b.probabilities, abs=1e-5)
+
+
+def test_fixed_batch_models_run_on_any_number_of_frames(colour_model, tmp_path):
+    import torch
+
+    from secondlook.diagnosis import load_classifier
+
+    base = colour_model("base")
+    fixed = tmp_path / "fixed4.onnx"
+    with __import__("warnings").catch_warnings():
+        __import__("warnings").simplefilter("ignore")
+        torch.onnx.export(colour_model.MeanColour(CATEGORIES, 4.0).eval(), (torch.zeros(4, 3, 64, 64),), str(fixed),
+                          input_names=["image"], output_names=["logits"], opset_version=17,
+                          **({"dynamo": False} if "dynamo" in __import__("inspect").signature(torch.onnx.export).parameters else {}))
+    fixed.with_suffix(".json").write_text(base.with_suffix(".json").read_text())
+    reference = load_classifier(base)
+    clf = load_classifier(fixed)
+    assert clf.batch_limit == 4
+    for n in (1, 3, 4, 5, 8):  # partial chunks, and the one-crop and 64-crop occlusion batches
+        a, b = reference.characterise(*_finding([RED] * n)), clf.characterise(*_finding([RED] * n))
+        assert b.category == "benign" and not b.abstained, b.abstain_reason
+        assert b.probabilities == pytest.approx(a.probabilities, abs=1e-6)
+        assert np.allclose(a.explanation_heatmap, b.explanation_heatmap, atol=1e-4)
 
 
 def test_classifier_rejects_models_that_do_not_fit_the_sidecar(colour_model):
@@ -701,11 +807,141 @@ def test_labels_problems_are_found_before_training(tmp_path):
         "images/1.png,adenoma,P2,900,500,120,120\n"
         "images/2.png,hyperplastic,P3,,,,\n"
         "images/broken.png,adenoma,P4,,,,\n"
+        "images/0.png,lipoma,P5,,,,\n"
+        "images/missing.png,adenoma,P6,,,,\n"
+        "images/also_missing.png,neoplastic,P7,,,,\n"
     )
     with pytest.raises(SystemExit) as e:
         tc.load_samples([tmp_path])
-    message = str(e.value)
+    message = str(e.value)  # every kind of problem in one round, not one kind per run
     assert "2 problems" in message and "lies outside image" in message and "cannot read image" in message
+    assert "Unknown labels: 'lipoma' (1 row), 'neoplastic' (1 row)" in message
+    assert "2 referenced files not found" in message and "missing.png" in message and "also_missing.png" in message
+
+
+def _write_rows(folder, rows, header="image,label,patient_id"):
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "labels.csv").write_text(header + "\n" + "".join(",".join(r) + "\n" for r in rows))
+    return folder
+
+
+def test_groups_follow_image_content_and_normalised_patient_ids(tmp_path):
+    tc = _train_module()
+    src = tmp_path / "orig"
+    (src / "images").mkdir(parents=True)
+    for i in range(4):
+        cv2.imwrite(str(src / "images" / f"{i}.png"), np.full((32, 32, 3), 40 * i, np.uint8))
+    _write_rows(src, [("images/0.png", "adenoma", ""), ("images/1.png", "adenoma", ""),
+                      ("images/2.png", "hyperplastic", " P01 "), ("images/3.png", "hyperplastic", "p01")])
+    before, _ = tc.load_samples([src])
+    assert before[2].group == before[3].group == "p01"  # one patient, whatever the case
+    assert before[0].group.startswith("image:") and before[0].group != before[1].group
+    moved = tmp_path / "moved"
+    src.rename(moved)
+    after, _ = tc.load_samples([moved])  # a moved or copied data set keeps its groups (and hashes)
+    assert [s.group for s in after] == [s.group for s in before]
+    assert all(s.image_sha256 for s in after)
+
+
+def test_development_overlap_compares_images_and_case_insensitive_patients(tmp_path):
+    tc = _train_module()
+    (tmp_path / "images").mkdir()
+    for i in range(3):
+        cv2.imwrite(str(tmp_path / "images" / f"{i}.png"), np.full((32, 32, 3), 60 * i, np.uint8))
+    dev = _write_rows(tmp_path / "dev", [(f"../images/{i}.png", "adenoma", f"SYN{i}") for i in range(2)])
+    dev_samples, _ = tc.load_samples([dev])
+    salt = "s"
+    manifest = {"salt": salt, "sha256_16": sorted({tc.group_hash(salt, k) for s in dev_samples for k in tc.identity_keys(s)})}
+    meta = {"training_data": ["/elsewhere/a"], "training_datasets": [], "init_training_datasets": []}
+
+    def check(folder, rows, header="image,label,patient_id", manifest=manifest, meta=meta):
+        samples, _ = tc.load_samples([_write_rows(folder, rows, header)])
+        return tc.development_overlap(meta, [folder], samples, manifest)
+
+    lower = check(tmp_path / "lower", [("../images/0.png", "adenoma", "syn0")])
+    assert lower["shared_patients"] == 1 and lower["shared_images"] == 1 and lower["overlap"]
+    no_ids = check(tmp_path / "noid", [("../images/1.png", "adenoma")], header="image,label")
+    assert no_ids["shared_images"] == 1 and no_ids["overlap"]
+    assert no_ids["patients_checked"] is False and no_ids["shared_patients"] is None and no_ids["rows_without_patient_id"] == 1
+    new = check(tmp_path / "new", [("../images/2.png", "adenoma", "Q9")])
+    assert not new["overlap"] and new["patients_checked"] and new["images_checked"] and new["shared_images"] == 0
+    unchecked = check(tmp_path / "unchecked", [("../images/0.png", "adenoma", "SYN0")], manifest=None)
+    assert not unchecked["patients_checked"] and not unchecked["images_checked"] and not unchecked["overlap"]
+    # A fine-tuned model also knows the data its --init checkpoint was trained on.
+    fine_tuned = {**meta, "init_training_datasets": [{"path": "/gone/dev", "labels_sha256": tc.file_sha256(dev / "labels.csv")}]}
+    import shutil as _sh
+    _sh.copytree(dev, tmp_path / "dev_copy")
+    copied = tc.development_overlap(fine_tuned, [tmp_path / "dev_copy"], [], None)
+    assert copied["same_labels_csv"] == [str(tmp_path / "dev_copy")] and copied["overlap"]
+    assert tc.init_lineage({"training_data": ["/old/path"]}) == [{"path": "/old/path"}]
+
+
+@pytest.mark.parametrize("argv, message", [
+    (["--crop-margin", "-0.4"], "--crop-margin"),
+    (["--crop-margin", "nan"], "--crop-margin"),
+    (["--crop-margin", "11"], "--crop-margin"),
+    (["--size", "4"], "--size"),
+])
+def test_trainer_refuses_settings_the_runtime_would_refuse(tmp_path, capsys, argv, message):
+    tc = _train_module()
+    with pytest.raises(SystemExit):
+        tc.main(["--data", str(tmp_path), "--out", str(tmp_path / "out"), *argv])
+    assert message in capsys.readouterr().err and not (tmp_path / "out").exists()
+
+
+def test_model_is_not_marked_calibrated_when_validation_lacks_a_class(tmp_path):
+    pytest.importorskip("torch")
+    pytest.importorskip("onnxruntime")
+    from secondlook import synthetic
+
+    tc = _train_module()
+    data = tmp_path / "lesions"
+    synthetic.generate_lesion_dataset(data, n_per_class=6, views_per_lesion=1, size=(64, 64), seed=0)
+    with (data / "labels.csv").open() as fh:
+        rows = list(csv.DictReader(fh))
+    seen: dict[str, int] = {}
+    for r in rows:  # cancers only in train and test; two patients of each other class in val
+        k = seen[r["label"]] = seen.get(r["label"], 0) + 1
+        r["split"] = ("train" if k % 2 else "test") if r["label"] == "cancerous" else \
+            "train" if k <= 3 else "val" if k <= 5 else "test"
+    with (data / "labels.csv").open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    out = tmp_path / "out"
+    tc.main(["--data", str(data), "--out", str(out), "--backbone", "tiny", "--size", "32", "--epochs", "1",
+             "--batch", "8", "--workers", "0", "--bootstrap", "0"])
+    meta = json.loads((out / "model.json").read_text())
+    assert meta["calibrated"] is False
+    assert any("no cancerous examples" in w and "not calibrated" in w for w in meta["validation_warnings"])
+    assert "development_patients" not in meta  # hashes of patient IDs stay out of the distributed sidecar
+    manifest = json.loads((out / "model.development.json").read_text())
+    assert len(manifest["sha256_16"]) == 18 + 18 and manifest["salt"]  # 18 patients and their 18 images
+
+
+def test_synthetic_sets_with_different_seeds_share_no_patients(tmp_path):
+    from secondlook import synthetic
+
+    tc = _train_module()
+    ids = {}
+    for seed in (0, 123):
+        folder = tmp_path / f"s{seed}"
+        synthetic.generate_lesion_dataset(folder, n_per_class=2, views_per_lesion=1, size=(64, 64), seed=seed)
+        with (folder / "labels.csv").open() as fh:
+            ids[seed] = {row["patient_id"] for row in csv.DictReader(fh)}
+        assert all(i.startswith(f"SYN{seed}-") for i in ids[seed])
+    assert not ids[0] & ids[123]
+    # So a set drawn with another seed is not reported as the development data of a model trained on the first.
+    first, _ = tc.load_samples([tmp_path / "s0"])
+    salt = "x"
+    manifest = {"salt": salt, "sha256_16": [tc.group_hash(salt, k) for s in first for k in tc.identity_keys(s)]}
+    second, _ = tc.load_samples([tmp_path / "s123"])
+    assert not tc.development_overlap({}, [tmp_path / "s123"], second, manifest)["overlap"]
+    custom = synthetic.generate_lesion_dataset(tmp_path / "p", n_per_class=1, views_per_lesion=1, size=(64, 64),
+                                               patient_prefix="SITEB-")
+    assert custom["patient_prefix"] == "SITEB-"
+    with pytest.raises(ValueError, match="patient_prefix"):
+        synthetic.generate_lesion_dataset(tmp_path / "bad", n_per_class=1, patient_prefix="../x")
 
 
 def test_diverging_training_stops_with_a_clear_message(tmp_path):
@@ -784,7 +1020,8 @@ def test_train_export_and_analyse_synthetic_lesions(tmp_path):
            "--workers", "0", "--bootstrap", "0", "--seed", "0", "--name", "e2e-tiny", "--version", "test"]
     run = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
     assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-3000:]
-    for name in ("model.onnx", "model.json", "best.pt", "metrics.json", "predictions_test.csv", "split.json"):
+    for name in ("model.onnx", "model.json", "best.pt", "model.development.json", "metrics.json",
+                 "predictions_test.csv", "split.json"):
         assert (out / name).exists(), name
 
     meta = json.loads((out / "model.json").read_text())
@@ -795,7 +1032,11 @@ def test_train_export_and_analyse_synthetic_lesions(tmp_path):
     assert {"val", "test"} <= set(meta["metrics"])
     assert meta["modality"] == "colonoscopy" and meta["working_size"] == 512 and isinstance(meta["calibrated"], bool)
     assert meta["synthetic_training_data"] is True and meta["training_datasets"][0]["synthetic"] is True
-    assert meta["training_data"] == [str(data.resolve())] and len(meta["development_patients"]["sha256_16"]) == 90
+    assert meta["training_data"] == [str(data.resolve())] and "development_patients" not in meta
+    from secondlook.ingest import file_sha256
+
+    manifest = json.loads((out / "model.development.json").read_text())
+    assert len(manifest["sha256_16"]) == 90 + 270 and manifest["model_sha256"] == file_sha256(out / "model.onnx")
     assert meta["class_weights"] == pytest.approx([1.0, 1.0, 1.0])  # balanced classes: no logit adjustment
 
     report = json.loads((out / "metrics.json").read_text())
@@ -820,6 +1061,7 @@ def test_train_export_and_analyse_synthetic_lesions(tmp_path):
     ev = json.loads((elsewhere / "evaluation" / "metrics.json").read_text())
     overlap = ev["overlap_with_development_data"]
     assert overlap["overlap"] and overlap["same_labels_csv"] == ["copy"] and overlap["shared_patients"] == 90
+    assert overlap["shared_images"] == 270 and overlap["patients_checked"] and overlap["images_checked"]
     assert "external" not in ev and ev["evaluation"]["n"] == 270
 
     # One lesion of each category in a recording; the default (heuristic) detector finds them.
@@ -829,8 +1071,6 @@ def test_train_export_and_analyse_synthetic_lesions(tmp_path):
     assert [p["category"] for p in truth["polyps"]] == CATEGORIES
     result = run_analysis(video, tmp_path / "review", "colonoscopy", tmp_path / "three_lesions_report.json",
                           audit_log=tmp_path / "audit.jsonl", classifier_path=out / "model.onnx")
-    from secondlook.ingest import file_sha256
-
     assert result["characteriser"]["name"] == "e2e-tiny" and result["characteriser"]["version"] == "test"
     assert result["characteriser"]["sha256"] == file_sha256(out / "model.onnx")
     assert result["findings"]

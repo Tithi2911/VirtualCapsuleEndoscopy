@@ -103,16 +103,30 @@ HISTOLOGY_TO_CATEGORY: dict[str, DiagnosticCategory] = {
 }
 
 
+# A known histology followed by a dysplasia grade, as pathology reports write it:
+# "tubular adenoma, low-grade dysplasia", "adenoma with high grade dysplasia", "SSL with dysplasia".
+# Negations ("no dysplasia", "negative for ...") leave an unknown base and still raise.
+_DYSPLASIA_SUFFIX = re.compile(r"^(?P<base>.+?)[\s,;]*(?:with\s+)?(?:(?:low|high)\s+grade\s+)?dysplasia$")
+_RISK_ORDER = list(DiagnosticCategory)
+
+
 def normalise_label(label: str) -> str:
     return re.sub(r"[\s_\-/]+", " ", str(label).strip().lower()).strip()
 
 
 def category_for(label: str, mapping: dict[str, DiagnosticCategory] | None = None) -> DiagnosticCategory:
-    """Map a histology or category label to a DiagnosticCategory. Raises KeyError if unknown."""
+    """Map a histology or category label to a DiagnosticCategory. Raises KeyError if unknown.
+
+    A known label followed by a dysplasia grade maps to the label's category, but never below
+    precancerous (dysplasia is neoplasia), so an adenocarcinoma stays cancerous."""
     table = mapping or HISTOLOGY_TO_CATEGORY
     key = normalise_label(label)
-    if key not in table:
-        raise KeyError(
-            f"Unknown histology label {label!r}. Add it to HISTOLOGY_TO_CATEGORY or pass a custom mapping."
-        )
-    return table[key]
+    if key in table:
+        return table[key]
+    m = _DYSPLASIA_SUFFIX.match(key)
+    base = m.group("base").strip(" ,;") if m else None
+    if base in table:
+        return max(table[base], _P, key=_RISK_ORDER.index)
+    raise KeyError(
+        f"Unknown histology label {label!r}. Add it to HISTOLOGY_TO_CATEGORY or pass a custom mapping."
+    )

@@ -85,7 +85,7 @@ cancer-like). They are for testing the pipeline, not a substitute for VR-Caps or
 * Lesion classifier: report per-class sensitivity and specificity, cancer sensitivity, neoplastic NPV,
   calibration and coverage at the abstention threshold, with patient-grouped confidence intervals.
   Take the headline figures from the deployed decision (abstention included), as the trainer prints them.
-* Classifier images: keep them at their native resolution; the trainer shrinks them to the analysis working
-  size itself, as the pipeline does with video frames.
   Evaluate diminutive rectosigmoid polyps separately against the ASGE PIVI thresholds
   ([DIAGNOSIS.md](DIAGNOSIS.md), section 5).
+* Classifier images: keep them at their native resolution; the trainer shrinks them to the analysis working
+  size itself, as the pipeline does with video frames.

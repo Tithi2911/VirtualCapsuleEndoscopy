@@ -25,6 +25,11 @@ from .pipeline import analyse
 from .review import load_report
 
 DEFAULT_AUDIT_LOG = Path.home() / ".secondlook" / "audit.jsonl"
+DEFAULT_DATA_DIR = Path.home() / ".secondlook" / "runs"
+AUDIT_LOG_LOCATIONS = (
+    f"analyse logs to {DEFAULT_AUDIT_LOG} (or --audit-log), serve to <data-dir>/audit.jsonl "
+    f"({DEFAULT_DATA_DIR / 'audit.jsonl'} by default) and demo to <out>/audit.jsonl"
+)
 # Seed of the colonoscopy demo recording drawn when a classifier is given: the baseline
 # detector finds all three lesions in it.
 DEMO_LESION_SEED = 1
@@ -90,17 +95,22 @@ def _print_summary(data: dict, out_dir: Path) -> None:
     print(f"Blind segments: {s['blind_segments']} ({s['blind_time_s']:.0f} s)")
     chars = [c for c in (f.get("characterisation") or {} for f in data["findings"]) if c.get("model")]
     clf = data.get("characteriser") or {}
+    counts = data["summary"]["ai_categories"]
     if clf.get("unsupported_reason"):
         print(f"WARNING: lesion classifier not applied: {clf['unsupported_reason']}.")
-    if chars:
+        if chars:  # the model never ran, so there is no per-category breakdown to show
+            print(f"  No AI category (classifier not applied): {counts[report.INDETERMINATE]}")
+    elif chars:
         sha = f", SHA-256 {clf['sha256'][:12]}" if clf.get("sha256") else ""
         print(f"AI optical diagnosis per finding ({chars[0]['model']} {chars[0].get('model_version')}{sha}):")
-        counts = data["summary"]["ai_categories"]
         for cat in CATEGORIES:
             print(f"  {DISPLAY_NAME[cat]}: {counts[cat]}")
         print(f"  No AI category (uncertain): {counts[report.INDETERMINATE]}")
         if clf.get("calibrated") is not True:
             print("  Probabilities are not calibrated: read them as a ranking, not as risks.")
+        else:
+            print("  Probabilities are calibrated on the model's own validation data only: they are model "
+                  "outputs, not risks for your patients.")
         if clf.get("validation_status"):
             print(f"  {clf['validation_status']}")
         print(f"  {SAFETY_STATEMENT}")
@@ -132,11 +142,13 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("serve", help="local web interface for uploading recordings (binds to localhost only)")
     s.add_argument("--port", type=int, default=8765)
-    s.add_argument("--data-dir", type=Path, default=Path.home() / ".secondlook" / "runs")
+    s.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR,
+                   help="where uploads, reports and this interface's audit.jsonl are kept")
     s.add_argument("--classifier", help=CLASSIFIER_HELP)
 
     v = sub.add_parser("audit-verify", help="check the audit log has not been altered")
-    v.add_argument("--log", type=Path, default=DEFAULT_AUDIT_LOG)
+    v.add_argument("--log", type=Path, default=DEFAULT_AUDIT_LOG,
+                   help=f"audit log to check (default {DEFAULT_AUDIT_LOG}). {AUDIT_LOG_LOCATIONS}")
 
     args = parser.parse_args(argv)
     print(INTENDED_USE_NOTICE, file=sys.stderr)
@@ -170,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "audit-verify":
         ok, msg = audit.verify(args.log)
         print(msg)
+        if not Path(args.log).is_file():
+            print(f"Each command keeps its own log: {AUDIT_LOG_LOCATIONS}. Check one with --log PATH.")
         return 0 if ok else 1
     return 0
 

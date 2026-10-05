@@ -1,5 +1,7 @@
 import json
 import threading
+import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -69,6 +71,21 @@ def test_audit_log_is_written_and_tamper_evident(colonoscopy_run):
     log.write_text("\n".join(lines) + "\n")
     ok, msg = audit.verify(log)
     assert not ok and "line 1" in msg
+    fresh = d / "fresh_audit.jsonl"
+    audit.append(fresh, "test-event", user="tester")
+    with fresh.open("a") as f:
+        f.write("{truncated\n")
+    assert audit.verify(fresh) == (False, "line 2: not a valid audit entry (altered or truncated)")
+
+
+def test_audit_verify_reports_a_missing_log_without_a_traceback(tmp_path, capsys):
+    from secondlook.cli import main
+
+    ok, msg = audit.verify(tmp_path / "none.jsonl")
+    assert not ok and "no audit log at" in msg
+    assert main(["audit-verify", "--log", str(tmp_path / "none.jsonl")]) == 1
+    out = capsys.readouterr().out
+    assert "no audit log at" in out and "<out>/audit.jsonl" in out and "<data-dir>/audit.jsonl" in out
 
 
 def test_capsule_frame_folder(tmp_path):
@@ -114,5 +131,26 @@ def test_local_server_upload(tmp_path):
                                      headers={"X-Filename": "frame.png", "X-Modality": "capsule"})
         result = json.loads(urllib.request.urlopen(req).read())
         assert b"Second-look review" in urllib.request.urlopen(base + result["report"]).read()
+
+        # The recording keeps its own (sanitised) name in the report, result and audit log.
+        req = urllib.request.Request(base + "/analyse", data=body, method="POST", headers={
+            "X-Filename": urllib.parse.quote("my procedure (1)<x>.png"), "X-Modality": "capsule"})
+        named = json.loads(urllib.request.urlopen(req).read())
+        page = urllib.request.urlopen(base + named["report"]).read().decode()
+        assert "my procedure (1)_x_.png" in page
+        entry = json.loads((tmp_path / "runs" / "audit.jsonl").read_text().splitlines()[-1])
+        assert entry["input_name"] == "my procedure (1)_x_.png"
+        runs = urllib.request.urlopen(base + "/runs").read().decode()  # newest first
+        assert runs.index("my procedure (1)_x_.png") < runs.index("frame.png")
+
+        # A bad procedure report, or a failed analysis, leaves no upload behind.
+        before = sorted(p.name for p in (tmp_path / "runs").iterdir())
+        for headers in ({"X-Report": "{not json"}, {"X-Report": urllib.parse.quote('[{"id": "R1"}]')}):
+            req = urllib.request.Request(base + "/analyse", data=body, method="POST", headers={
+                "X-Filename": "frame.png", "X-Modality": "capsule", **headers})
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(req)
+            assert err.value.code in (400, 422) and json.loads(err.value.read())["error"]
+        assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == before
     finally:
         server.shutdown()

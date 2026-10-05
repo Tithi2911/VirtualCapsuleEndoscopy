@@ -8,7 +8,8 @@ medical device.
 
 Output (in --out): model.onnx + model.json (sidecar read by
 secondlook.diagnosis.classifier), best.pt (PyTorch checkpoint for fine-tuning),
-metrics.json, predictions_test.csv and split.json.
+model.development.json (hashed development patients and images, for
+--evaluate-only), metrics.json, predictions_test.csv and split.json.
 
 Choices that keep the reported numbers honest:
 
@@ -19,10 +20,19 @@ Choices that keep the reported numbers honest:
   model's class prior. The shift is removed from the exported logits (logit
   adjustment) before the temperature is fitted, so probabilities track the real
   class mix rather than inflating the rare cancer class.
-* With --init, patients the checkpoint was trained on (recorded, hashed, in
-  best.pt) are kept in the training split, so they cannot inflate val/test.
-* The sidecar records resolved data paths, labels.csv hashes and hashed
-  patient IDs, so --evaluate-only can detect overlap with the development data.
+* With --init, patients and images the checkpoint was trained on (recorded,
+  hashed, in best.pt) are kept in the training split, so they cannot inflate
+  val/test. Images without a patient_id are identified by their content, so this
+  holds when the data set is moved or copied.
+* The sidecar records resolved data paths and labels.csv hashes (including those
+  of an --init checkpoint's data); model.development.json records salted hashes
+  of every development patient ID and image file. --evaluate-only uses both to
+  detect overlap with the development data.
+
+Distribute only model.onnx and model.json. best.pt, model.development.json,
+split.json and predictions_test.csv are derived from patient data (split.json and
+the predictions name pseudonymous patient IDs; salted hashes of short IDs can be
+reversed by trying every possible ID) and stay with the data owner.
 
 Dataset layout. Each --data directory has a labels.csv:
 
@@ -120,6 +130,9 @@ LABEL_SMOOTHING = 0.05
 GRAD_CLIP = 1.0
 BBOX_JITTER = 0.10
 TEMPERATURE_RANGE = (0.05, 20.0)
+MAX_CROP_MARGIN = 10.0  # the runtime classifier refuses larger margins
+MIN_INPUT_SIZE = 8
+DEVELOPMENT_SUFFIX = ".development.json"
 ONNX_ATOL = 1e-3
 MIN_RELIABLE_PER_CLASS = 30
 INTENDED_USE = (
@@ -155,10 +168,13 @@ class Sample:
     label: str  # label as written in labels.csv
     category: int  # index into CATEGORIES
     patient_id: str  # "" when not given
-    group: str  # split unit: patient_id, or the image itself when no patient_id is given
+    # Split unit: the normalised patient_id, or the image content ("image:<sha256>") when no
+    # patient_id is given, so the unit does not change when the data set is moved or copied.
+    group: str
     bbox: Optional[tuple[int, int, int, int]]
     bbox_shape: Optional[tuple[int, int]]  # (h, w) of the mask the bbox came from, if any
     split: Optional[str]
+    image_sha256: str = ""  # SHA-256 of the image file's bytes
 
     def bbox_in(self, shape: tuple[int, ...]) -> Optional[tuple[int, int, int, int]]:
         """The bbox in the pixel grid of an image of `shape` (masks may be stored at another size)."""
@@ -220,8 +236,24 @@ def _mask_bbox(path: Path) -> tuple[Optional[tuple[int, int, int, int]], tuple[i
     return bbox_from_mask(mask > threshold), mask.shape[:2]
 
 
+def patient_key(patient_id: str) -> str:
+    """A patient ID as compared everywhere (split, --init, overlap): case and outer spaces ignored."""
+    return patient_id.strip().casefold()
+
+
+def identity_keys(s: Sample) -> set[str]:
+    """What identifies a sample's source: its patient (when given) and its image content."""
+    return {s.group, f"image:{s.image_sha256}"} if s.image_sha256 else {s.group}
+
+
+def lookup_keys(s: Sample) -> set[str]:
+    """identity_keys plus the raw patient ID, which checkpoints of earlier versions hashed."""
+    return identity_keys(s) | ({s.patient_id} if s.patient_id else set())
+
+
 def load_samples(data_dirs: list[Path]) -> tuple[list[Sample], list[str]]:
-    """Read every labels.csv. Collects all problems first so the user can fix them in one go."""
+    """Read every labels.csv. Collects every problem (unknown labels, missing or unreadable files,
+    bad boxes or splits) and reports them together, so the user can fix them in one go."""
     samples: list[Sample] = []
     notes: list[str] = []
     unknown: Counter[str] = Counter()
@@ -243,56 +275,69 @@ def load_samples(data_dirs: list[Path]) -> tuple[list[Sample], list[str]]:
             for line, raw in enumerate(reader, start=2):
                 row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items() if isinstance(v, str)}
                 where = f"{csv_path}:{line}"
-                if not row.get("image"):
-                    problems.append(f"{where}: empty image path")
-                    continue
+                ok = True  # every check runs on every row, so all problems are listed at once
+                category = -1
                 try:
                     category = CATEGORIES.index(category_for(row.get("label", "")).value)
                 except KeyError:
                     unknown[row.get("label", "")] += 1
+                    ok = False
+                if not row.get("image"):
+                    problems.append(f"{where}: empty image path")
                     continue
                 path = _resolve(root, row["image"])
-                if not path.is_file():
+                image_ok = path.is_file()
+                if not image_ok:
                     missing.append(str(path))
-                    continue
+                    ok = False
                 split = None
                 if row.get("split"):
                     split = SPLIT_ALIASES.get(row["split"].lower())
                     if split is None:
                         problems.append(f"{where}: split must be train, val or test, got {row['split']!r}")
-                        continue
+                        ok = False
+                bbox, bbox_shape = None, None
                 try:
-                    bbox, bbox_shape = _read_bbox(row), None
+                    bbox = _read_bbox(row)
                     if bbox is None and row.get("mask"):
                         mask_path = _resolve(root, row["mask"])
                         if not mask_path.is_file():
                             missing.append(str(mask_path))
-                            continue
-                        bbox, bbox_shape = _mask_bbox(mask_path)
-                        empty_masks += bbox is None
+                            ok = False
+                        else:
+                            bbox, bbox_shape = _mask_bbox(mask_path)
+                            empty_masks += bbox is None
                 except ValueError as e:
                     problems.append(f"{where}: {e}")
-                    continue
+                    ok = False
                 patient = row.get("patient_id", "")
                 sample = Sample(
                     path=path, image=row["image"], dataset=str(root), label=row.get("label", ""),
-                    category=category, patient_id=patient, group=patient or f"image:{path.resolve()}",
-                    bbox=bbox, bbox_shape=bbox_shape, split=split,
+                    category=category, patient_id=patient, group="", bbox=bbox, bbox_shape=bbox_shape, split=split,
                 )
-                try:  # unreadable images and boxes outside the image, before hours of training
-                    sample.bbox_in(image_shape(path))
-                except ValueError as e:
-                    problems.append(f"{where}: {e}")
+                if image_ok:
+                    try:  # unreadable images and boxes outside the image, before hours of training
+                        sample.bbox_in(image_shape(path))
+                    except ValueError as e:
+                        problems.append(f"{where}: {e}")
+                        ok = False
+                if not ok:
                     continue
+                # Content, not path: a moved or copied data set keeps its groups and hashes.
+                sample.image_sha256 = file_sha256(path)
+                sample.group = patient_key(patient) if patient_key(patient) else f"image:{sample.image_sha256}"
                 samples.append(sample)
+    report = []
     if unknown:
         listed = ", ".join(f"{label!r} ({_n(n, 'row')})" for label, n in unknown.most_common())
-        fail(f"Unknown labels: {listed}. Fix labels.csv or add them to HISTOLOGY_TO_CATEGORY in "
-             "secondlook/diagnosis/taxonomy.py.")
+        report.append(f"Unknown labels: {listed}. Fix labels.csv or add them to HISTOLOGY_TO_CATEGORY in "
+                      "secondlook/diagnosis/taxonomy.py.")
     if missing:
-        fail(f"{_n(len(missing), 'referenced file')} not found, e.g.:\n  " + "\n  ".join(missing[:10]))
+        report.append(f"{_n(len(missing), 'referenced file')} not found, e.g.:\n  " + "\n  ".join(missing[:10]))
     if problems:
-        fail(f"{_n(len(problems), 'problem')} in labels.csv:\n  " + "\n  ".join(problems[:20]))
+        report.append(f"{_n(len(problems), 'problem')} in labels.csv:\n  " + "\n  ".join(problems[:20]))
+    if report:
+        fail("\n".join(report))
     if not samples:
         fail("No labelled images found.")
     if empty_masks:
@@ -856,9 +901,11 @@ def _num(v: Optional[float]) -> str:
 
 
 def _ci(ci: Optional[dict], metric: str, fmt=_num) -> str:
-    if not ci or ci.get(metric, {}).get("low") is None:
-        return ""
-    return f" [95% CI {fmt(ci[metric]['low'])}-{fmt(ci[metric]['high'])}]"
+    m = (ci or {}).get(metric) or {}
+    if m.get("low") is not None:
+        exact = f", exact: {m['note']}" if m.get("method") == "exact" else ""
+        return f" [95% CI {fmt(m['low'])}-{fmt(m['high'])}{exact}]"
+    return f" [95% CI {m['note']}]" if m.get("note") else ""
 
 
 def print_summary(title: str, report: dict, abstain_below: float, ci: Optional[dict] = None) -> list[str]:
@@ -931,25 +978,81 @@ def dataset_fingerprint(root: Path, rows: int) -> dict:
             "synthetic": synthetic if isinstance(synthetic, bool) else None}
 
 
-def development_overlap(meta: dict, data_dirs: list[Path], samples: list[Sample]) -> dict:
-    """What the evaluation data share with the model's development (train/val/test) data: the same
-    directory, a labels.csv with identical content (a copy), or patients. Absence of overlap does not
+def _dataset_list(value) -> list[dict]:
+    return [d for d in value or [] if isinstance(d, dict)]
+
+
+def init_lineage(init_config: dict) -> list[dict]:
+    """Data sets an --init checkpoint and its own ancestors were trained on (path, labels.csv hash)."""
+    out = _dataset_list(init_config.get("init_training_datasets"))
+    own = init_config.get("training_datasets")
+    if own is None:  # checkpoints of earlier versions record paths only
+        own = [{"path": str(p)} for p in init_config.get("training_data") or []]
+    seen, unique = set(), []
+    for d in out + _dataset_list(own):
+        key = (d.get("path"), d.get("labels_sha256"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique
+
+
+def development_manifest_path(model_path: Path) -> Path:
+    return model_path.with_suffix(DEVELOPMENT_SUFFIX)
+
+
+def load_development_manifest(model_path: Path, meta: dict, model_sha256: str) -> tuple[Optional[dict], str]:
+    """Salted hashes of the development data (patients and images) and where they came from."""
+    path = development_manifest_path(model_path)
+    if path.is_file():
+        try:
+            manifest = json.loads(path.read_text())
+        except ValueError as e:
+            return None, f"{path} is not valid JSON ({e})"
+        if manifest.get("model_sha256") not in (None, model_sha256):
+            return None, f"{path} belongs to another model file (SHA-256 differs)"
+        if manifest.get("salt") and isinstance(manifest.get("sha256_16"), list):
+            return manifest, str(path)
+        return None, f"{path} holds no development hashes"
+    legacy = meta.get("development_patients")  # sidecars of earlier versions carried the hashes
+    if isinstance(legacy, dict) and legacy.get("salt") and isinstance(legacy.get("sha256_16"), list):
+        return legacy, f"{model_path.with_suffix('.json')} (development_patients)"
+    return None, f"no {path.name} next to the model"
+
+
+def development_overlap(meta: dict, data_dirs: list[Path], samples: list[Sample],
+                        manifest: Optional[dict] = None) -> dict:
+    """What the evaluation data share with the model's development (train/val/test) data, its --init
+    checkpoint's included: the same directory, a labels.csv with identical content (a copy),
+    patients (IDs compared ignoring case) or byte-identical image files. Absence of overlap does not
     make a data set external; only its source (another centre, device or period) can."""
     trained = meta.get("training_data") or []
+    lineage = _dataset_list(meta.get("training_datasets")) + _dataset_list(meta.get("init_training_datasets"))
     trained_paths = {str(Path(p).resolve()) for p in ([trained] if isinstance(trained, str) else trained)}
-    fingerprints = {d.get("labels_sha256") for d in meta.get("training_datasets") or [] if isinstance(d, dict)}
+    trained_paths |= {str(Path(d["path"]).resolve()) for d in lineage if d.get("path")}
+    fingerprints = {d.get("labels_sha256") for d in lineage if d.get("labels_sha256")}
+    without_id = sum(1 for s in samples if not s.patient_id)
     out: dict = {
         "same_directory": [str(d) for d in data_dirs if str(d.resolve()) in trained_paths],
         "same_labels_csv": [str(d) for d in data_dirs if file_sha256(d / "labels.csv") in fingerprints],
         "shared_patients": None,
+        "shared_patient_examples": [],
+        "shared_images": None,
         "patients_checked": False,
+        "images_checked": False,
+        "rows_without_patient_id": without_id,
     }
-    dev = meta.get("development_patients") or {}
-    if isinstance(dev, dict) and dev.get("salt") and dev.get("sha256_16"):
-        known = set(dev["sha256_16"])
-        shared = sorted({s.patient_id for s in samples if s.patient_id and group_hash(dev["salt"], s.patient_id) in known})
-        out.update(shared_patients=len(shared), shared_patient_examples=shared[:5], patients_checked=True)
-    out["overlap"] = bool(out["same_directory"] or out["same_labels_csv"] or out["shared_patients"])
+    if manifest:
+        salt, known = manifest["salt"], set(manifest["sha256_16"])
+        shared = sorted({s.patient_id for s in samples if s.patient_id and any(
+            group_hash(salt, k) in known for k in (patient_key(s.patient_id), s.patient_id))})
+        out["images_checked"] = all(s.image_sha256 for s in samples)
+        out["shared_images"] = sum(1 for s in samples if s.image_sha256
+                                   and group_hash(salt, f"image:{s.image_sha256}") in known)
+        if without_id < len(samples):  # patients can only be compared where IDs are given
+            out.update(shared_patients=len(shared), shared_patient_examples=shared[:5], patients_checked=True)
+    out["overlap"] = bool(out["same_directory"] or out["same_labels_csv"] or out["shared_patients"]
+                          or out["shared_images"])
     return out
 
 
@@ -979,12 +1082,20 @@ def train(args) -> None:
         warn.append(f"{args.init} does not record which patients it was trained on, so some of them may now be "
                     "in val or test, which inflates every metric. Retrain the checkpoint with this version.")
         print(f"WARNING: {warn[-1]}")
-    pinned = {s.group for s in samples if group_hash(salt, s.group) in inherited}
+    # A patient is pinned when its ID or any of its images was in the checkpoint's training data.
+    pinned = {s.group for s in samples if any(group_hash(salt, k) in inherited for k in lookup_keys(s))}
     parts, split_info, split_warn = split_samples(samples, args.val_frac, args.test_frac, args.seed, pinned)
     write_json(args.out / "split.json", split_info)
     print(f"Split: {split_info['method']}, unit = {split_info['unit']} (written to {args.out / 'split.json'})")
     if pinned:
-        print(f"  {_n(len(pinned), 'patient')} the --init checkpoint was trained on kept in the training split.")
+        images = sum(g.startswith("image:") for g in pinned)
+        kept = " and ".join(t for t in (_n(len(pinned) - images, "patient") if len(pinned) > images else "",
+                                         _n(images, "image") + " without patient_id" if images else "") if t)
+        print(f"  {kept} the --init checkpoint was trained on kept in the training split.")
+    elif inherited:
+        print(f"Note: none of the patients or images {args.init} was trained on are in --data. That is expected "
+              "for new data; if --data includes the checkpoint's own data, its images have changed (re-encoded "
+              "or edited) and they cannot be kept out of val and test.")
     print_class_counts(parts)
     for w in split_warn:
         print(f"WARNING: {w}")
@@ -1041,17 +1152,19 @@ def train(args) -> None:
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
 
     datasets = [dataset_fingerprint(d, sum(1 for s in samples if s.dataset == str(d))) for d in args.data]
+    lineage = init_lineage(init_config) if args.init else []
     synthetic_only = all(d["synthetic"] is True for d in datasets) and init_config.get("synthetic_only", True) is True
-    trained_hashes = sorted(inherited | {group_hash(salt, s.group) for s in parts["train"]})
+    trained_hashes = sorted(inherited | {group_hash(salt, k) for s in parts["train"] for k in identity_keys(s)})
     config = {
         "name": name, "version": version, "backbone": args.backbone, "classes": CATEGORIES,
         "input_size": args.size, "mean": MEAN, "std": STD, "crop_margin": args.crop_margin,
         "modality": args.modality, "working_size": working_size,
-        "training_data": [d["path"] for d in datasets], "seed": args.seed,
+        "training_data": [d["path"] for d in datasets], "training_datasets": datasets,
+        "init_training_datasets": lineage, "seed": args.seed,
         "pretrained": "imagenet" if args.pretrained and not args.init else (str(args.weights) if args.weights else None),
         "init": str(args.init.resolve()) if args.init else None,
         "synthetic_only": synthetic_only,
-        # Every patient this weight lineage has been trained on, for --init of the next run.
+        # Every patient and image this weight lineage has been trained on, for --init of the next run.
         "group_salt": salt, "trained_group_hashes": trained_hashes,
     }
     history: list[dict] = []
@@ -1107,10 +1220,18 @@ def train(args) -> None:
     y_test = np.array([s.category for s in parts["test"]])
     fitted = temperature = fit_temperature(val_logits, y_val)
     calibrated = True
-    small = [c for c, n in class_counts(parts["val"]).items() if n < MIN_RELIABLE_PER_CLASS]
+    val_counts = class_counts(parts["val"])
+    absent = [c for c, n in val_counts.items() if n == 0]
+    small = [c for c, n in val_counts.items() if 0 < n < MIN_RELIABLE_PER_CLASS]
     if small:
         warn.append(f"The validation set has fewer than {MIN_RELIABLE_PER_CLASS} examples of {', '.join(small)}, "
                     "so early stopping and the fitted temperature (hence probabilities and abstention) are noisy.")
+        print(f"WARNING: {warn[-1]}")
+    if absent:
+        calibrated = False
+        warn.append(f"The validation set has no {', '.join(absent)} examples, so the temperature was fitted and "
+                    "the best epoch chosen without them: probabilities are not calibrated. Put patients with "
+                    f"{', '.join(absent)} lesions in the validation split.")
         print(f"WARNING: {warn[-1]}")
     if len(y_val) and bool((val_logits.argmax(axis=1) == y_val).all()) and fitted < 1.0:
         # Validation NLL then keeps falling as T -> 0, so the fit only finds the search limit.
@@ -1157,7 +1278,11 @@ def train(args) -> None:
         warn.append("Trained on synthetic images only: a software test, not a clinical model.")
 
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    development = {s.group for sp in SPLITS for s in parts[sp] if s.patient_id}
+    # Salted hashes of every development patient and image (and of what an --init checkpoint was
+    # trained on), so --evaluate-only can detect overlap. Kept out of the sidecar, which travels
+    # with the model: short IDs can be recovered from salted hashes by trying them all.
+    development = sorted(inherited | {group_hash(salt, k) for sp in SPLITS for s in parts[sp] for k in identity_keys(s)})
+    manifest_path = development_manifest_path(onnx_path)
     sidecar = {
         "name": name, "version": version, "task": "lesion-classification", "classes": CATEGORIES,
         "input_size": args.size, "mean": MEAN, "std": STD, "crop_margin": args.crop_margin,
@@ -1166,10 +1291,8 @@ def train(args) -> None:
         "abstain_below": args.abstain_below,
         "min_frame_agreement": args.min_frame_agreement, "output": "logits", "backbone": args.backbone,
         "training_data": config["training_data"], "training_datasets": datasets,
+        "init_training_datasets": lineage,
         "synthetic_training_data": synthetic_only,
-        # Salted hashes of every patient in train/val/test (and of earlier --init training patients),
-        # so --evaluate-only can detect overlap without the model file carrying patient IDs.
-        "development_patients": {"salt": salt, "sha256_16": sorted(inherited | {group_hash(salt, g) for g in development})},
         "split_sizes": split_info["sizes"],
         "class_weights": class_weights.tolist(), "logit_adjustment": adjust.tolist(),
         "metrics": {"val": val_report, "test": test_report}, "created_utc": created,
@@ -1181,6 +1304,12 @@ def train(args) -> None:
         "torch_version": torch.__version__,
     }
     write_json(args.out / "model.json", sidecar)
+    write_json(manifest_path, {
+        "note": "Salted, truncated SHA-256 hashes of the development data's patient IDs and image files, read by "
+                "train_classifier.py --evaluate-only. Derived from patient data: keep with the data owner, do not "
+                "distribute with the model.",
+        "model_sha256": file_sha256(onnx_path), "salt": salt, "sha256_16": development,
+    })
     write_json(args.out / "metrics.json", {
         "model": {"name": name, "version": version, "backbone": args.backbone, "onnx": str(onnx_path),
                   "sha256": file_sha256(onnx_path)},
@@ -1197,7 +1326,9 @@ def train(args) -> None:
         "warnings": warn,
         "intended_use": INTENDED_USE,
     })
-    print(f"\nWrote {onnx_path}, model.json, best.pt, metrics.json, predictions_test.csv, split.json to {args.out}")
+    print(f"\nWrote {onnx_path}, model.json, best.pt, {manifest_path.name}, metrics.json, predictions_test.csv, "
+          f"split.json to {args.out}")
+    print("Distribute model.onnx and model.json only: the other files are derived from patient data.")
     print(f"Model {name} version {version}, SHA-256 {file_sha256(onnx_path)[:12]}")
     print(f"Use it: secondlook analyse VIDEO --modality {args.modality} --classifier {onnx_path}")
     print(INTENDED_USE)
@@ -1231,22 +1362,35 @@ def evaluate_only(args) -> None:
         print(f"Note: {note}")
     if any(s.split for s in samples):
         print("Note: the split column is ignored; --evaluate-only evaluates every row.")
-    overlap = development_overlap(meta, args.data, samples)
+    manifest, manifest_source = load_development_manifest(model_path, meta, clf.sha256)
+    overlap = development_overlap(meta, args.data, samples, manifest)
+    overlap["development_manifest"] = manifest_source if manifest else None
     if overlap["same_directory"] or overlap["same_labels_csv"]:
         same = sorted(set(overlap["same_directory"]) | set(overlap["same_labels_csv"]))
-        warn.append(f"{', '.join(same)} was used to develop this model (same directory or identical labels.csv), "
-                    "so this is NOT an external validation.")
+        warn.append(f"{', '.join(same)} was used to develop this model or its --init checkpoint (same directory or "
+                    "identical labels.csv), so this is NOT an external validation.")
         print(f"WARNING: {warn[-1]}")
     if overlap["shared_patients"]:
         examples = ", ".join(overlap["shared_patient_examples"])
         warn.append(f"{_n(overlap['shared_patients'], 'patient')} in --data (e.g. {examples}) were in this model's "
                     "development data, so this is NOT an external validation.")
         print(f"WARNING: {warn[-1]}")
-    if not overlap["patients_checked"]:
-        print("Note: the sidecar does not record its development patients, so patient overlap was not checked.")
+    if overlap["shared_images"]:
+        warn.append(f"{_n(overlap['shared_images'], 'image')} in --data are byte-identical to images in this model's "
+                    "development data, so this is NOT an external validation.")
+        print(f"WARNING: {warn[-1]}")
+    if not manifest:
+        print(f"Note: patient and image overlap was not checked ({manifest_source}); only the data directories "
+              "and labels.csv files were compared with the model's development data.")
+    elif overlap["rows_without_patient_id"]:
+        print(f"Note: {overlap['rows_without_patient_id']} of {len(samples)} rows have no patient_id, so patient "
+              "overlap could not be checked for them; they were compared by image content only, which does not "
+              "recognise a re-encoded, resized or cropped copy.")
     if not overlap["overlap"]:
-        print("No overlap with the model's development data was detected. Whether this is an external "
-              "validation (another centre, device or period) depends on where the data came from.")
+        checked = ["data directories", "labels.csv files"] + (["image files"] if overlap["images_checked"] else []) \
+            + (["patient IDs"] if overlap["patients_checked"] else [])
+        print(f"No overlap with the model's development data was detected ({', '.join(checked)} compared). Whether "
+              "this is an external validation (another centre, device or period) depends on where the data came from.")
     if not all(s.patient_id for s in samples):
         warn.append("Some rows have no patient_id; confidence intervals treat each such image as its own patient "
                     "and are too narrow if several images show the same lesion.")
@@ -1299,6 +1443,20 @@ def _abstain_threshold(value: str) -> float:
     return v
 
 
+def _crop_margin(value: str) -> float:
+    v = float(value)
+    if not (math.isfinite(v) and 0 <= v <= MAX_CROP_MARGIN):
+        raise argparse.ArgumentTypeError(f"must be between 0 and {MAX_CROP_MARGIN:g} (the classifier refuses other values)")
+    return v
+
+
+def _input_size(value: str) -> int:
+    v = int(value)
+    if v < MIN_INPUT_SIZE:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_INPUT_SIZE} pixels")
+    return v
+
+
 def _fraction(value: str) -> float:
     v = float(value)
     if not (math.isfinite(v) and 0 <= v <= 1):
@@ -1320,13 +1478,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--pretrained", action="store_true", help="start from torchvision ImageNet weights (download)")
     ap.add_argument("--weights", type=Path, help="local backbone state_dict, e.g. torchvision ImageNet .pth")
     ap.add_argument("--init", type=Path, help="full best.pt checkpoint to fine-tune (e.g. synthetic pre-training)")
-    ap.add_argument("--size", type=int, default=224, help="crop size in pixels")
+    ap.add_argument("--size", type=_input_size, default=224, help=f"crop size in pixels (at least {MIN_INPUT_SIZE})")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=0.05)
     ap.add_argument("--patience", type=int, default=8, help="early stopping patience in epochs")
-    ap.add_argument("--crop-margin", type=float, default=DEFAULT_MARGIN, help="context around the lesion box")
+    ap.add_argument("--crop-margin", type=_crop_margin, default=DEFAULT_MARGIN,
+                    help=f"context around the lesion box, as a fraction of its larger side (0 to {MAX_CROP_MARGIN:g})")
     ap.add_argument("--abstain-below", type=_abstain_threshold, default=0.6,
                     help=f"abstain when the top calibrated probability is below this, {MIN_ABSTAIN_BELOW} to <1 "
                          "(written to the sidecar; --evaluate-only uses the sidecar's value)")

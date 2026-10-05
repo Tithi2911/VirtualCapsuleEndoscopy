@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -562,6 +563,7 @@ def generate_lesion_dataset(
     seed: int = 0,
     kinds: Sequence[str] | None = None,
     atypical_fraction: float = 0.15,
+    patient_prefix: str | None = None,
 ) -> dict:
     """Write labelled synthetic lesion images in the training/train_classifier.py format.
 
@@ -573,6 +575,10 @@ def generate_lesion_dataset(
     A fraction of lesions (`atypical_fraction`) is drawn part-way towards the neighbouring
     category but keeps its true label. Without that overlap the classes are perfectly
     separable, so calibration, abstention and the error metrics could never be exercised.
+
+    Patient IDs are `patient_prefix` plus a number; the default prefix "SYN<seed>-" keeps sets
+    generated with different seeds apart, so they are not mistaken for the same patients when
+    combined, fine-tuned with --init or used to evaluate each other.
 
     Writes out_dir/images/*.png, out_dir/masks/*.png (white = lesion), out_dir/labels.csv
     (image,label,patient_id,mask,appearance) and out_dir/dataset.json. `size` is (width,
@@ -586,6 +592,9 @@ def generate_lesion_dataset(
     w, h = int(size[0]), int(size[1])
     if min(w, h) < 64:
         raise ValueError("size must be at least 64 x 64 pixels")
+    prefix = f"SYN{seed}-" if patient_prefix is None else str(patient_prefix)
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", prefix):
+        raise ValueError("patient_prefix may only contain letters, digits, '-' and '_'")
     cats = _lesion_categories(kinds) if kinds is not None else list(CATEGORIES)
     cats = list(dict.fromkeys(cats))
     out_dir = Path(out_dir)
@@ -605,7 +614,7 @@ def generate_lesion_dataset(
     # PNG encoding releases the GIL, so files are written while the next lesion is drawn.
     with ThreadPoolExecutor(max_workers=2) as pool:
         for i, kind in enumerate(assignment):
-            pid = f"SYN{i + 1:05d}"
+            pid = f"{prefix}{i + 1:05d}"
             scene = _mucosa(2 * half + 1, rng, height=2 * half + 1, low_res=4)
             typicality = rng.uniform(0.35, 0.65) if rng.random() < atypical_fraction else 1.0
             atypical[kind] += typicality < 1
@@ -642,6 +651,7 @@ def generate_lesion_dataset(
         "views_per_lesion": views_per_lesion,
         "size": [w, h],
         "seed": seed,
+        "patient_prefix": prefix,
         "atypical_fraction": atypical_fraction,
         "per_class": {c: {"patients": n_per_class, "images": n_per_class * views_per_lesion,
                           "atypical_patients": atypical[c]} for c in cats},

@@ -10,6 +10,8 @@ from __future__ import annotations
 import html
 import json
 import re
+import shutil
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,14 +53,26 @@ async function go(){
   const f=document.getElementById('file').files[0], st=document.getElementById('status');
   if(!f){st.textContent='Choose a file first.';return;}
   const rep=document.getElementById('report').files[0];
-  st.textContent='Uploading and analysing... this can take a few minutes for long videos.';
   const h={'X-Filename':encodeURIComponent(f.name),'X-Modality':document.getElementById('modality').value};
-  if(rep){h['X-Report']=encodeURIComponent(await rep.text());}
+  if(rep){
+    const t=await rep.text();
+    try{JSON.parse(t);}catch(e){st.textContent='Error: the procedure report is not valid JSON ('+e.message+').';return;}
+    h['X-Report']=encodeURIComponent(t);
+  }
+  st.textContent='Uploading and analysing... this can take a few minutes for long videos.';
   const r=await fetch('/analyse',{method:'POST',headers:h,body:f});
   const j=await r.json();
   if(r.ok){location.href=j.report;}else{st.textContent='Error: '+j.error;}
 }
 </script></body></html>"""
+
+
+def safe_upload_name(name: str) -> str:
+    """The uploaded file's own name, reduced to characters safe in a path, so the report and the
+    audit log name the recording the user chose rather than a generic one."""
+    path = Path(name)
+    stem = re.sub(r"[^A-Za-z0-9._ ()+-]", "_", path.stem).strip(" .")[:100] or "upload"
+    return stem + path.suffix.lower()
 
 
 def classifier_status(characteriser: Characteriser) -> str:
@@ -104,13 +118,27 @@ def make_handler(data_dir: Path, classifier_path: Path | str | None = None):
             if self.path in ("/", "/index.html"):
                 return self._send(HTTPStatus.OK, upload_page, "text/html; charset=utf-8")
             if self.path == "/runs":
-                runs = sorted((p for p in data_dir.iterdir() if (p / "report.html").exists()), reverse=True)
-                items = "".join(f'<li><a href="/runs/{p.name}/report.html">{html.escape(p.name)}</a></li>' for p in runs)
-                return self._send(HTTPStatus.OK, f"<!doctype html><meta charset=utf-8><title>Runs</title><ul>{items}</ul>".encode(), "text/html")
+                return self._send(HTTPStatus.OK, self._runs_page(), "text/html; charset=utf-8")
             m = re.fullmatch(r"/runs/([A-Za-z0-9_-]+)/report\.html", self.path)
             if m and (data_dir / m.group(1) / "report.html").exists():
                 return self._send(HTTPStatus.OK, (data_dir / m.group(1) / "report.html").read_bytes(), "text/html; charset=utf-8")
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+        def _runs_page(self) -> bytes:
+            """Previous analyses, newest first, with the recording's name."""
+            runs = sorted((p for p in data_dir.iterdir() if (p / "report.html").exists()),
+                          key=lambda p: (p / "report.html").stat().st_mtime, reverse=True)
+            items = []
+            for p in runs:
+                try:
+                    name = Path(json.loads((p / "result.json").read_text()).get("input") or "").name
+                except (OSError, ValueError, AttributeError):
+                    name = ""
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime((p / "report.html").stat().st_mtime))
+                items.append(f'<li><a href="/runs/{p.name}/report.html">{html.escape(when)} '
+                             f'{html.escape(name or p.name)}</a></li>')
+            return (f"<!doctype html><meta charset=utf-8><title>Runs</title><h1>Previous analyses</h1>"
+                    f"<ul>{''.join(items)}</ul>").encode()
 
         def do_POST(self):
             if self.path != "/analyse":
@@ -120,34 +148,44 @@ def make_handler(data_dir: Path, classifier_path: Path | str | None = None):
             length = int(self.headers.get("Content-Length", 0))
             if not 0 < length <= MAX_UPLOAD_BYTES:
                 return self._json(HTTPStatus.BAD_REQUEST, {"error": "empty or too large upload"})
-            name = Path(unquote(self.headers.get("X-Filename", "upload"))).name
+            name = safe_upload_name(Path(unquote(self.headers.get("X-Filename", "upload"))).name)
             ext = Path(name).suffix.lower()
             if ext not in VIDEO_EXTS | IMAGE_EXTS:
                 return self._json(HTTPStatus.BAD_REQUEST, {"error": f"unsupported file type {ext}"})
             modality = self.headers.get("X-Modality", Modality.COLONOSCOPY.value)
             if modality not in {m.value for m in Modality}:
                 return self._json(HTTPStatus.BAD_REQUEST, {"error": "unknown modality"})
+            report_text = unquote(self.headers["X-Report"]) if self.headers.get("X-Report") else None
+            if report_text is not None:
+                try:  # before the upload is stored, so a bad report leaves nothing behind
+                    json.loads(report_text)
+                except ValueError as e:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": f"the procedure report is not valid JSON: {e}"})
 
             run_id = uuid.uuid4().hex[:12]
             run_dir = data_dir / run_id
             run_dir.mkdir()
-            upload = run_dir / f"input{ext}"
-            remaining = length
-            with open(upload, "wb") as f:
-                while remaining:
-                    chunk = self.rfile.read(min(remaining, 1 << 20))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    remaining -= len(chunk)
-            report_path = None
-            if self.headers.get("X-Report"):
-                report_path = run_dir / "procedure_report.json"
-                report_path.write_text(unquote(self.headers["X-Report"]))
             try:
+                (run_dir / "input").mkdir()
+                upload = run_dir / "input" / name
+                remaining = length
+                with open(upload, "wb") as f:
+                    while remaining:
+                        chunk = self.rfile.read(min(remaining, 1 << 20))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        remaining -= len(chunk)
+                if remaining:
+                    raise ValueError(f"upload incomplete: {remaining} of {length} bytes missing")
+                report_path = None
+                if report_text is not None:
+                    report_path = run_dir / "procedure_report.json"
+                    report_path.write_text(report_text)
                 run_analysis(upload, run_dir, modality, report_path, audit_log=data_dir / "audit.jsonl",
                              characteriser=characteriser)
             except Exception as e:  # report the failure to the browser rather than dropping the connection
+                shutil.rmtree(run_dir, ignore_errors=True)  # no orphaned recording without a report
                 return self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(e)})
             self._json(HTTPStatus.OK, {"report": f"/runs/{run_id}/report.html"})
 

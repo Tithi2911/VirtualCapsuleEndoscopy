@@ -7,7 +7,9 @@ abstains rather than guess when the probability is low, the frames disagree,
 some frames confidently point to a higher-risk category than the average, or
 the model output is not a number, because a confident wrong optical diagnosis
 is worse than none. Averaging alone would let a minority of frames showing,
-say, a depressed cancerous area vanish into a precancerous call.
+say, a depressed cancerous area vanish into a precancerous call. A benign call
+is the one that can lead to a lesion being left in place, so it is withheld
+when even one frame confidently gives a neoplastic category.
 
 An occlusion-sensitivity map shows which part of the lesion crop drove the
 predicted category, so the reviewer can check it looked at the lesion. The map
@@ -60,9 +62,13 @@ SAFETY_STATEMENT = "A prediction of histology, not a histological diagnosis: con
 EXPLANATION_SIZE = 256  # minimum side of the explanation crop shown in the report
 DEFAULT_MODALITY = "colonoscopy"
 # Abstain when at least this many frames (and this share of them) each confidently give a
-# higher-risk category than the frame average. CATEGORIES is in risk order.
+# higher-risk category than the frame average. CATEGORIES is in risk order. A benign call is
+# withheld when any single frame confidently gives a neoplastic category: short tracks (2 or 3
+# frames) could otherwise never trigger the rule, and a benign call drives "leave in place".
 ESCALATION_MIN_FRAMES = 2
 ESCALATION_FRACTION = 0.25
+OUTPUT_KINDS = ("logits", "probabilities")
+PROBABILITY_ATOL = 1e-3
 
 
 def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
@@ -167,7 +173,11 @@ class OnnxLesionClassifier:
         self.abstain_below = _finite(meta_path, "abstain_below", get("abstain_below", 0.6), MIN_ABSTAIN_BELOW, 1,
                                      high_open=True)
         self.min_frame_agreement = _finite(meta_path, "min_frame_agreement", get("min_frame_agreement", 0.5), 0, 1)
-        self.output_is_logits = get("output", "logits") == "logits"
+        output = str(get("output", "logits")).strip().lower()
+        if output not in OUTPUT_KINDS:
+            # Any other value would silently read logits as probabilities, or the reverse.
+            raise ValueError(f"{meta_path}: output must be one of {list(OUTPUT_KINDS)}, got {self.meta.get('output')!r}")
+        self.output_is_logits = output == "logits"
         modality = get("modality", DEFAULT_MODALITY)
         self.modalities = [str(m) for m in (modality if isinstance(modality, list) else [modality])]
         working_size = self.meta.get("working_size")
@@ -184,7 +194,7 @@ class OnnxLesionClassifier:
         self.output_name = "logits" if "logits" in out_names else out_names[0]
         in_shape = list(inputs[names.index(self.input_name)].shape)
         batch_dim = in_shape[0] if in_shape else None
-        # Models exported with a fixed batch size are run in chunks of that size.
+        # Models exported with a fixed batch size are run in chunks of that size, the last one padded.
         self.batch_limit = batch_dim if isinstance(batch_dim, int) and batch_dim > 0 else None
         self._check_model(meta_path, in_shape, list(outputs[out_names.index(self.output_name)].shape))
 
@@ -211,6 +221,17 @@ class OnnxLesionClassifier:
             raise ValueError(f"{meta_path}: the model returned shape {out.shape} for a batch of {n}; expected ({n}, {k})")
         if not np.isfinite(out).all():
             raise ValueError(f"{meta_path}: the model returns non-finite values (NaN or infinity) on a plain input")
+        if not self.output_is_logits and not (
+                (out >= -PROBABILITY_ATOL).all() and (out <= 1 + PROBABILITY_ATOL).all()
+                and np.allclose(out.sum(axis=1), 1.0, atol=PROBABILITY_ATOL)):
+            raise ValueError(f"{meta_path}: the sidecar says output is 'probabilities', but the model returned "
+                             f"{out[0].round(4).tolist()}, which is not a probability per class summing to 1; "
+                             "for raw scores set output to 'logits'")
+        if self.batch_limit and self.batch_limit > 1:
+            try:  # a partial batch, as the last chunk of frames and every occlusion map produce
+                self._run(np.zeros((1, 3, s, s), np.float32))
+            except Exception as e:
+                raise ValueError(f"{meta_path}: the model does not run on a partial batch: {e}") from e
 
     def _describe(self) -> dict:
         """Provenance and validation status shown with every AI category in the report."""
@@ -227,6 +248,7 @@ class OnnxLesionClassifier:
         if not self.calibrated:
             status.append("Probabilities are not calibrated.")
         data = meta.get("training_data") or []
+        init_data = [d for d in meta.get("init_training_datasets") or [] if isinstance(d, dict) and d.get("path")]
         return {
             "sha256": self.sha256,
             "sidecar_sha256": self.sidecar_sha256,
@@ -236,6 +258,8 @@ class OnnxLesionClassifier:
             "working_size": self.working_size,
             "abstain_below": self.abstain_below,
             "training_data": [Path(str(p)).name for p in (data if isinstance(data, list) else [data])],
+            # Data an --init checkpoint (and its own ancestors) was trained on before fine-tuning.
+            "init_training_data": [Path(str(d["path"])).name for d in init_data],
             "synthetic_training_data": meta.get("synthetic_training_data"),
             "validation_status": " ".join(status),
             "validation_warnings": [str(w) for w in meta.get("validation_warnings") or []],
@@ -258,12 +282,26 @@ class OnnxLesionClassifier:
         image, bbox = at_working_size(_as_bgr(image), bbox, self.working_size)
         return crop_lesion(image, bbox, size or self.input_size, self.crop_margin)
 
+    def _run(self, x: np.ndarray) -> np.ndarray:
+        """Raw model output (N, 3) in the model's own class order. A model with a fixed batch size
+        is run in chunks of that size, the last one padded with zeros and the padding dropped."""
+        step = self.batch_limit or max(len(x), 1)
+        outs = []
+        for i in range(0, len(x), step):
+            chunk = x[i : i + step]
+            n = len(chunk)
+            if n < step:
+                chunk = np.concatenate([chunk, np.zeros((step - n, *chunk.shape[1:]), chunk.dtype)])
+            out = self.session.run([self.output_name], {self.input_name: chunk})[0]
+            if len(out) != len(chunk):
+                raise ValueError(f"the model returned {len(out)} rows for a batch of {len(chunk)}")
+            outs.append(out[:n])
+        return np.concatenate(outs) if outs else np.zeros((0, len(CATEGORIES)))
+
     def logits(self, x: np.ndarray) -> np.ndarray:
         """Uncalibrated logits (N, 3) in CATEGORIES order for a to_model_input batch
         (log-probabilities for a model that outputs probabilities)."""
-        step = self.batch_limit or len(x)
-        outs = [self.session.run([self.output_name], {self.input_name: x[i : i + step]})[0] for i in range(0, len(x), step)]
-        out = np.concatenate(outs).astype(np.float64)[:, self.class_order]
+        out = self._run(x).astype(np.float64)[:, self.class_order]
         return out if self.output_is_logits else np.log(np.clip(out, 1e-12, None))
 
     def predict(self, x: np.ndarray) -> np.ndarray:
@@ -344,7 +382,8 @@ class OnnxLesionClassifier:
             reasons.append(f"frames disagree ({agree}/{n} agree)")
         frame_calls = decide(probs, self.abstain_below)
         higher = frame_calls > top  # abstaining frames are ABSTAIN (-1), never higher
-        if higher.sum() >= max(ESCALATION_MIN_FRAMES, math.ceil(ESCALATION_FRACTION * n)):
+        needed = 1 if CATEGORIES[top] == "benign" else max(ESCALATION_MIN_FRAMES, math.ceil(ESCALATION_FRACTION * n))
+        if higher.sum() >= needed:
             worst = CATEGORIES[int(frame_calls.max())]
             reasons.append(f"{int(higher.sum())} of {n} frames confidently suggest a higher-risk category "
                            f"({DISPLAY_NAME[worst]})")

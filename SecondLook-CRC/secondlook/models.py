@@ -89,7 +89,7 @@ class Characterisation:
     # Arrays are excluded from JSON output; the report renders them as an image.
     explanation_crop: Optional[np.ndarray] = None
     explanation_heatmap: Optional[np.ndarray] = None
-    note: str = "No lesion classifier configured; lesion is uncharacterised."
+    note: str = "Not characterised: no lesion classifier configured."
 
 
 @dataclass
