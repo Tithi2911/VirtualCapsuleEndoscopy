@@ -32,6 +32,13 @@ def draw_outline(image: np.ndarray, mask: np.ndarray, thickness: int = 2) -> Non
     cv2.drawContours(image, contours, -1, OUTLINE_BGR, thickness)
 
 
+def diagnosis_overlay(crop: np.ndarray, heatmap: np.ndarray, size: int = 256) -> np.ndarray:
+    """Classifier explanation: which parts of the lesion crop drove the predicted category."""
+    crop = cv2.resize(crop, (size, size))
+    heat = cv2.resize(np.clip(heatmap, 0, 1).astype(np.float32), (size, size))
+    return heatmap_overlay(crop, heat, None)
+
+
 def _fmt_time(t: float) -> str:
     m, s = divmod(t, 60)
     return f"{int(m):02d}:{s:04.1f}"

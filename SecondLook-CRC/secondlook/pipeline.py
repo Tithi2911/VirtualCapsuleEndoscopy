@@ -28,6 +28,7 @@ class AnalysisResult:
     detector: str
     detector_version: str
     characteriser: str
+    characteriser_version: str
     frames_analysed: int
     frames_informative: int
     duration_s: float
@@ -37,7 +38,7 @@ class AnalysisResult:
     report_supplied: bool
     timeline: list[tuple[float, bool]]  # (timestamp, informative) per analysed frame
     runtime_s: float
-    # finding_id -> {"original", "overlay", "filmstrip"} BGR images
+    # finding_id -> {"original", "overlay", "filmstrip", optional "diagnosis"} BGR images
     images: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
 
@@ -82,7 +83,8 @@ def analyse(
         best = f.best
         img = kept_images[best.frame_index]
         f.rationale = explain.rationale(f, quality_by_index.get(best.frame_index))
-        f.characterisation = characteriser.characterise(f, img)
+        finding_frames = {d.frame_index: kept_images[d.frame_index] for d in f.detections}
+        f.characterisation = characteriser.characterise(f, finding_frames)
         picks = np.linspace(0, len(f.detections) - 1, min(FILMSTRIP_FRAMES, len(f.detections))).round().astype(int)
         strip = [kept_images[f.detections[i].frame_index] for i in picks]
         images[f.finding_id] = {
@@ -90,6 +92,9 @@ def analyse(
             "overlay": explain.heatmap_overlay(img, best.heatmap, best.mask),
             "filmstrip": explain.filmstrip(strip),
         }
+        c = f.characterisation
+        if c.explanation_crop is not None and c.explanation_heatmap is not None:
+            images[f.finding_id]["diagnosis"] = explain.diagnosis_overlay(c.explanation_crop, c.explanation_heatmap)
 
     return AnalysisResult(
         input_path=str(path),
@@ -97,6 +102,7 @@ def analyse(
         detector=detector.name,
         detector_version=detector.version,
         characteriser=characteriser.name,
+        characteriser_version=characteriser.version,
         frames_analysed=len(frames),
         frames_informative=sum(q.informative for q in qualities),
         duration_s=frames[-1].timestamp_s,

@@ -1,10 +1,14 @@
 """Lesion characterisation (CADx) plug-in point.
 
-Estimating histology or malignancy risk from images is the clinically riskiest
-output this product could make, so it is deliberately empty until a model has
-been trained on histology-confirmed data and validated (see docs/DESIGN.md,
-"Characterisation"). The interface is fixed now so that reports, audit and the
-review UI already carry the fields.
+A Characteriser receives a finding plus the images of the frames it was seen
+in, and returns a Characterisation. Using several frames, not just the best
+one, makes the prediction more stable and lets the classifier report how much
+the frames agree.
+
+Without a trained classifier the NullCharacteriser is used and every lesion is
+reported as uncharacterised. Optical diagnosis is the clinically riskiest output
+of this software and must never be produced by an untrained rule. See
+secondlook/diagnosis/ and docs/DIAGNOSIS.md.
 """
 
 from __future__ import annotations
@@ -18,12 +22,17 @@ from .models import Characterisation, Finding
 
 class Characteriser(Protocol):
     name: str
+    version: str
 
-    def characterise(self, finding: Finding, best_image: np.ndarray) -> Characterisation: ...
+    def characterise(self, finding: Finding, frames: dict[int, np.ndarray]) -> Characterisation:
+        """`frames` maps original frame index -> BGR image for frames in which the finding was detected
+        (at least the finding's best frame). Detection bboxes are in those images' pixel coordinates."""
+        ...
 
 
 class NullCharacteriser:
     name = "none"
+    version = "-"
 
-    def characterise(self, finding: Finding, best_image: np.ndarray) -> Characterisation:
+    def characterise(self, finding: Finding, frames: dict[int, np.ndarray]) -> Characterisation:
         return Characterisation()

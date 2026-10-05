@@ -56,13 +56,36 @@ class Detection:
 
 @dataclass
 class Characterisation:
-    """Optical-diagnosis output (CADx). Empty unless a validated model is configured."""
+    """AI optical diagnosis (CADx) of one finding.
+
+    Empty unless a trained lesion classifier is configured. `category` is one of
+    secondlook.diagnosis.taxonomy.DiagnosticCategory values ("benign",
+    "precancerous", "cancerous"), or None when the model abstained. Optical
+    diagnosis is a prediction of the histology; histopathology remains the
+    reference standard.
+    """
 
     model: Optional[str] = None
-    histology_prediction: Optional[str] = None  # e.g. "adenomatous" / "hyperplastic"
-    malignancy_risk: Optional[float] = None  # 0..1
-    morphology: Optional[str] = None  # e.g. Paris classification
-    note: str = "No validated characterisation model configured; lesion is uncharacterised."
+    model_version: Optional[str] = None
+    category: Optional[str] = None
+    # Calibrated probabilities per category, aggregated over the frames used.
+    probabilities: dict[str, float] = field(default_factory=dict)
+    confidence: Optional[float] = None  # probability of the predicted category
+    abstained: bool = False
+    abstain_reason: Optional[str] = None
+    frames_used: int = 0
+    # Fraction of the frames used whose own top category equals the aggregate category.
+    frame_agreement: Optional[float] = None
+    malignancy_risk: Optional[float] = None  # P(cancerous)
+    neoplasia_risk: Optional[float] = None  # P(precancerous) + P(cancerous)
+    histology_prediction: Optional[str] = None  # finer subtype, only if the model predicts one
+    morphology: Optional[str] = None  # e.g. Paris classification, if a model provides it
+    # Explanation of the classifier's decision: the lesion crop it saw (BGR) and a
+    # 0..1 map of the same size showing which parts drove the predicted category.
+    # Arrays are excluded from JSON output; the report renders them as an image.
+    explanation_crop: Optional[np.ndarray] = None
+    explanation_heatmap: Optional[np.ndarray] = None
+    note: str = "No lesion classifier configured; lesion is uncharacterised."
 
 
 @dataclass
