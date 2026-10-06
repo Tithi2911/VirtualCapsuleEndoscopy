@@ -1,8 +1,0 @@
-{
-  "procedure_id": "EXAMPLE-001",
-  "findings": [
-    {"id": "R1", "time_s": 312.4, "location": "sigmoid", "note": "6 mm sessile polyp, cold snare"},
-    {"id": "R2", "time_s": 845.0, "location": "caecum", "note": "flat lesion, tattooed"},
-    {"id": "R3", "frame_index": 10234, "location": "transverse", "note": "diminutive polyp, not removed"}
-  ]
-}
